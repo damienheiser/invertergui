@@ -1,0 +1,119 @@
+#!/bin/sh /etc/rc.common
+# Energy Manager init script for OpenWRT/procd
+
+START=99
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/bin/energymanager
+CONFIG=/etc/config/energymanager
+
+start_service() {
+    config_load energymanager
+
+    local enabled listen shelly_addr shelly_interval shelly_autoconfig
+    local victron_enabled victron_port victron_maxpower
+    local bmv_enabled bmv_port
+    local battery_capacity latitude longitude
+    local pid_enabled pid_kp pid_ki pid_kd pid_setpoint
+    local default_mode
+    local mqtt_enabled mqtt_broker mqtt_topic mqtt_clientid mqtt_username mqtt_password
+    local auth_username auth_password
+
+    # Main config
+    config_get_bool enabled main enabled 1
+    [ "$enabled" -eq 0 ] && return 0
+
+    config_get listen main listen ":8080"
+    config_get shelly_addr main shelly_addr ""
+    config_get shelly_interval main shelly_interval "1s"
+    config_get_bool shelly_autoconfig main shelly_autoconfig 1
+
+    # Victron VE.Bus config (MultiPlus/Quattro via MK2/MK3)
+    config_get_bool victron_enabled victron enabled 1
+    config_get victron_port victron port "/dev/ttyUSB0"
+    config_get victron_maxpower victron maxpower "5000"
+
+    # Victron BMV config (Battery Monitor via VE.Direct)
+    config_get_bool bmv_enabled bmv enabled 1
+    config_get bmv_port bmv port "/dev/ttyUSB1"
+
+    # Battery config
+    config_get battery_capacity battery capacity "10.0"
+
+    # Location config
+    config_get latitude location latitude "40.7128"
+    config_get longitude location longitude "-74.0060"
+
+    # PID config
+    config_get_bool pid_enabled pid enabled 1
+    config_get pid_kp pid kp "0.8"
+    config_get pid_ki pid ki "0.05"
+    config_get pid_kd pid kd "0.1"
+    config_get pid_setpoint pid setpoint "0"
+
+    # Mode config
+    config_get default_mode mode default "pid"
+
+    # MQTT config
+    config_get_bool mqtt_enabled mqtt enabled 0
+    config_get mqtt_broker mqtt broker "tcp://localhost:1883"
+    config_get mqtt_topic mqtt topic "energy/status"
+    config_get mqtt_clientid mqtt clientid "energymanager"
+    config_get mqtt_username mqtt username ""
+    config_get mqtt_password mqtt password ""
+
+    # Auth config (for protected endpoints)
+    config_get auth_username auth username ""
+    config_get auth_password auth password ""
+
+    procd_open_instance
+    procd_set_param command $PROG \
+        -listen "$listen" \
+        -shelly.addr "$shelly_addr" \
+        -shelly.interval "$shelly_interval" \
+        -shelly.autoconfig="$shelly_autoconfig" \
+        -victron.enabled="$victron_enabled" \
+        -victron.port "$victron_port" \
+        -victron.maxpower "$victron_maxpower" \
+        -bmv.enabled="$bmv_enabled" \
+        -bmv.port "$bmv_port" \
+        -battery.capacity "$battery_capacity" \
+        -latitude "$latitude" \
+        -longitude "$longitude" \
+        -pid.enabled="$pid_enabled" \
+        -pid.kp "$pid_kp" \
+        -pid.ki "$pid_ki" \
+        -pid.kd "$pid_kd" \
+        -pid.setpoint "$pid_setpoint" \
+        -mode "$default_mode" \
+        -mqtt.enabled="$mqtt_enabled" \
+        -mqtt.broker "$mqtt_broker" \
+        -mqtt.topic "$mqtt_topic" \
+        -mqtt.clientid "$mqtt_clientid" \
+        -mqtt.username "$mqtt_username" \
+        -mqtt.password "$mqtt_password" \
+        -auth.username "$auth_username" \
+        -auth.password "$auth_password"
+
+    procd_set_param respawn
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param nice -5
+    procd_close_instance
+
+    logger -t energymanager "Energy Manager started"
+}
+
+stop_service() {
+    logger -t energymanager "Energy Manager stopped"
+}
+
+service_triggers() {
+    procd_add_reload_trigger "energymanager"
+}
+
+reload_service() {
+    stop
+    start
+}
