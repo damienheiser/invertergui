@@ -4,6 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -107,6 +111,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/discover", h.requireAuth(h.handleDiscover))
 	mux.HandleFunc("/api/tou", h.requireAuth(h.handleTOU))
 	mux.HandleFunc("/api/schedule", h.requireAuth(h.handleSchedule))
+	mux.HandleFunc("/api/ports", h.requireAuth(h.handlePorts))
 }
 
 func (h *Handler) serveDashboard(w http.ResponseWriter, r *http.Request) {
@@ -191,6 +196,77 @@ func (h *Handler) handleSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+}
+
+func (h *Handler) handlePorts(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	ports := detectSerialPorts()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"ports": ports,
+	})
+}
+
+// detectSerialPorts scans /dev/ for serial port devices
+func detectSerialPorts() []string {
+	var ports []string
+
+	// Common serial port patterns
+	patterns := []string{
+		"/dev/ttyUSB*",
+		"/dev/ttyACM*",
+		"/dev/ttyS*",
+		"/dev/ttyAMA*",
+		"/dev/serial/by-id/*",
+		"/dev/serial/by-path/*",
+	}
+
+	seen := make(map[string]bool)
+
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+		for _, match := range matches {
+			// Resolve symlinks to get actual device
+			resolved, err := filepath.EvalSymlinks(match)
+			if err != nil {
+				resolved = match
+			}
+
+			// Skip if we've already seen this device
+			if seen[resolved] {
+				continue
+			}
+			seen[resolved] = true
+
+			// Check if it's a character device (serial port)
+			info, err := os.Stat(match)
+			if err != nil {
+				continue
+			}
+			mode := info.Mode()
+			if mode&os.ModeCharDevice != 0 || mode&os.ModeSymlink != 0 {
+				// For by-id and by-path, include the full path for better identification
+				if strings.Contains(match, "/by-id/") || strings.Contains(match, "/by-path/") {
+					ports = append(ports, match)
+				} else {
+					ports = append(ports, resolved)
+				}
+			}
+		}
+	}
+
+	// Sort for consistent ordering
+	sort.Strings(ports)
+
+	// If no ports found, add common defaults
+	if len(ports) == 0 {
+		ports = []string{"/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyACM0"}
+	}
+
+	return ports
 }
 
 func (h *Handler) handleMode(w http.ResponseWriter, r *http.Request) {
@@ -689,10 +765,12 @@ textarea { width: 100%%; min-height: 200px; padding: 1rem; background: #0f172a; 
         </div>
 
         <div class="card">
-            <h2>Victron Inverter</h2>
+            <h2>Victron Inverter (VE.Bus)</h2>
             <div class="form-group">
-                <label>Serial Port</label>
-                <input type="text" id="victron-port" value="%s" placeholder="/dev/ttyUSB0">
+                <label>Serial Port (MK3 USB)</label>
+                <select id="victron-port" class="port-select">
+                    <option value="%s" selected>%s</option>
+                </select>
             </div>
             <div class="form-group">
                 <label>Max Power (W)</label>
@@ -702,6 +780,20 @@ textarea { width: 100%%; min-height: 200px; padding: 1rem; background: #0f172a; 
                 <label>Battery Capacity (kWh)</label>
                 <input type="number" id="battery-capacity" value="%.1f" min="0" max="100" step="0.1">
             </div>
+        </div>
+
+        <div class="card">
+            <h2>Battery Monitor (VE.Direct)</h2>
+            <p style="color: #64748b; font-size: 0.875rem; margin-bottom: 1rem;">
+                BMV-700/712 or SmartShunt via VE.Direct USB cable
+            </p>
+            <div class="form-group">
+                <label>Serial Port</label>
+                <select id="bmv-port" class="port-select">
+                    <option value="%s" selected>%s</option>
+                </select>
+            </div>
+            <button type="button" class="btn btn-secondary" onclick="refreshPorts()">Refresh Serial Ports</button>
         </div>
 
         <div class="card">
@@ -922,6 +1014,7 @@ function saveConfig() {
     const config = {
         shelly_addr: document.getElementById('shelly-addr').value,
         victron_port: document.getElementById('victron-port').value,
+        bmv_port: document.getElementById('bmv-port').value,
         max_power: parseFloat(document.getElementById('max-power').value),
         battery_capacity: parseFloat(document.getElementById('battery-capacity').value),
         latitude: parseFloat(document.getElementById('latitude').value),
@@ -954,8 +1047,15 @@ function saveConfig() {
     .then(r => r.json())
     .then(data => {
         if (data.status === 'ok') {
-            alert('Configuration saved!');
-            location.href = '/';
+            // Show success message without redirect
+            const btn = document.querySelector('.btn-primary');
+            const origText = btn.textContent;
+            btn.textContent = 'Saved!';
+            btn.style.background = '#4ade80';
+            setTimeout(() => {
+                btn.textContent = origText;
+                btn.style.background = '';
+            }, 2000);
         } else {
             alert('Error saving configuration');
         }
@@ -1089,16 +1189,39 @@ function loadExampleSchedule(example) {
     renderSchedulePeriods();
 }
 
+// Refresh serial ports from system
+function refreshPorts() {
+    fetch('/api/ports')
+        .then(r => r.json())
+        .then(data => {
+            const ports = data.ports || [];
+            document.querySelectorAll('.port-select').forEach(select => {
+                const currentVal = select.value;
+                // Keep first option as current value, add detected ports
+                const options = ['<option value="' + currentVal + '">' + currentVal + '</option>'];
+                ports.forEach(port => {
+                    if (port !== currentVal) {
+                        options.push('<option value="' + port + '">' + port + '</option>');
+                    }
+                });
+                select.innerHTML = options.join('');
+            });
+        })
+        .catch(err => console.error('Failed to refresh ports:', err));
+}
+
 renderTOUPeriods();
 renderSchedulePeriods();
+refreshPorts(); // Load ports on page load
 </script>
 </body>
 </html>`,
 		dashboardCSS(),
 		h.config.ShellyAddr,
-		h.config.VictronPort,
+		h.config.VictronPort, h.config.VictronPort, // port select value and label
 		h.config.MaxPower,
 		h.config.BatteryCapacity,
+		h.config.BMVPort, h.config.BMVPort, // BMV port select value and label
 		h.config.PIDKp, h.config.PIDKi, h.config.PIDKd, h.config.PIDSetpoint,
 		h.config.Latitude, h.config.Longitude,
 		checkedAttr(h.config.SolarConfig.ZeroExport),
