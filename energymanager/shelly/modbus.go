@@ -141,21 +141,24 @@ func (c *ModbusClient) readRegisters(unitID byte, funcCode byte, addr uint16, co
 	return regs, nil
 }
 
-// ReadFloat32 reads a 32-bit float from two consecutive registers
+// ReadFloat32 reads a 32-bit float from two consecutive registers (little-endian word order)
 func (c *ModbusClient) ReadFloat32(unitID byte, addr uint16) (float64, error) {
 	regs, err := c.ReadInputRegisters(unitID, addr, 2)
 	if err != nil {
 		return 0, err
 	}
-	bits := uint32(regs[0])<<16 | uint32(regs[1])
+	// Shelly uses little-endian word order: low word first, then high word
+	bits := uint32(regs[1])<<16 | uint32(regs[0])
 	return float64(math.Float32frombits(bits)), nil
 }
 
-// RegistersToFloat32 converts two registers to float32
+// RegistersToFloat32 converts two registers to float32 (little-endian word order)
+// Shelly devices use low word first, then high word
 func RegistersToFloat32(regs []uint16, offset int) float64 {
 	if offset+1 >= len(regs) {
 		return 0
 	}
-	bits := uint32(regs[offset])<<16 | uint32(regs[offset+1])
+	// Low word first, then high word
+	bits := uint32(regs[offset+1])<<16 | uint32(regs[offset])
 	return float64(math.Float32frombits(bits))
 }

@@ -158,10 +158,10 @@ echo ""
 echo "Access points:"
 LAN_IP=$(uci get network.lan.ipaddr 2>/dev/null || echo "192.168.8.1")
 echo "  - Landing Page: http://${LAN_IP}/"
-echo "  - Energy Dashboard: http://${LAN_IP}:8080/"
+echo "  - Energy Dashboard: http://${LAN_IP}:8081/"
 echo "  - ZeroTier: http://${LAN_IP}/cgi-bin/luci/admin/vpn/zerotier/"
 echo ""
-echo "Configure Shelly EM3 at: http://${LAN_IP}:8080/config"
+echo "Configure Shelly EM3 at: http://${LAN_IP}:8081/config"
 INSTALL_EOF
 chmod +x ${DEPLOY_DIR}/install.sh
 

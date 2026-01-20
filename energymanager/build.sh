@@ -62,4 +62,5 @@ echo "  4. Edit /etc/config/energymanager with your Shelly IP"
 echo "  5. /etc/init.d/energymanager enable"
 echo "  6. /etc/init.d/energymanager start"
 echo ""
-echo "Web UI will be available at http://<router-ip>:8080"
+# Port 8081 to avoid conflict with GL.iNet admin panel on 8080
+echo "Web UI will be available at http://<router-ip>:8081"

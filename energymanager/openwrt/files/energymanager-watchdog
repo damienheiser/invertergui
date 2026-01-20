@@ -1,0 +1,31 @@
+#!/bin/sh
+# Energy Manager watchdog script
+# Checks if the web server is responding and restarts if not
+
+HEALTH_URL="http://127.0.0.1:8081/health"
+MAX_FAILURES=3
+FAILURE_FILE="/tmp/energymanager_failures"
+
+# Initialize failure counter
+if [ ! -f "$FAILURE_FILE" ]; then
+    echo "0" > "$FAILURE_FILE"
+fi
+
+# Check health endpoint
+if curl -s -o /dev/null -w '' --connect-timeout 5 --max-time 10 "$HEALTH_URL"; then
+    # Success - reset counter
+    echo "0" > "$FAILURE_FILE"
+else
+    # Failed - increment counter
+    FAILURES=$(cat "$FAILURE_FILE" 2>/dev/null || echo "0")
+    FAILURES=$((FAILURES + 1))
+    echo "$FAILURES" > "$FAILURE_FILE"
+
+    logger -t energymanager-watchdog "Health check failed ($FAILURES/$MAX_FAILURES)"
+
+    if [ "$FAILURES" -ge "$MAX_FAILURES" ]; then
+        logger -t energymanager-watchdog "Max failures reached, restarting service"
+        /etc/init.d/energymanager restart
+        echo "0" > "$FAILURE_FILE"
+    fi
+fi
