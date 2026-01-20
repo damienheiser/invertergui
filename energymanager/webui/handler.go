@@ -943,12 +943,15 @@ func dashboardJS(overrideActive bool) string {
 var overrideActive = %s;
 
 // Fix navigation links to use port 80 (nginx) instead of current port
+// LuCI runs on nginx (port 80), not on energymanager (port 8081)
 (function() {
     var baseURL = window.location.protocol + '//' + window.location.hostname;
 
-    // LuCI link
-    var luciLink = document.getElementById('luci-link');
-    if (luciLink) luciLink.href = baseURL + '/cgi-bin/luci/';
+    // LuCI links (both nav and quick links)
+    ['luci-link', 'luci-admin-link'].forEach(function(id) {
+        var el = document.getElementById(id);
+        if (el) el.href = baseURL + '/cgi-bin/luci/admin/';
+    });
 
     // GL.iNet link (main admin interface)
     var glinetLink = document.getElementById('glinet-link');
@@ -1430,11 +1433,12 @@ textarea { width: 100%%; min-height: 200px; padding: 1rem; background: #0f172a; 
 
 <script>
 // Fix LuCI links to use port 80 (nginx) instead of current port
+// LuCI runs on nginx (port 80), not on energymanager (port 8081)
 (function() {
     var luciBase = window.location.protocol + '//' + window.location.hostname;
     var luciLinks = document.querySelectorAll('#luci-link, #luci-admin-link');
     luciLinks.forEach(function(link) {
-        link.href = luciBase + '/cgi-bin/luci/';
+        link.href = luciBase + '/cgi-bin/luci/admin/';
     });
 })();
 
