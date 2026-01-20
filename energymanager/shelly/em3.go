@@ -8,42 +8,35 @@ import (
 	"github.com/diebietse/invertergui/energymanager/core"
 )
 
-// Shelly Pro 3EM Modbus Register Addresses (Input Registers)
-// These are the actual Modbus addresses (not the 30001+ offset shown in some docs)
-// Reference: https://github.com/pipelka/dbus-modbus-shelly
+// Shelly Pro 3EM Modbus Register Addresses (Input Registers, Function Code 4)
+// Official register map from Shelly documentation
+// All registers are Float32 (2 registers each, Big-Endian)
 const (
-	// Total values
-	RegTotalCurrent  = 1011 // float, A
-	RegTotalPower    = 1013 // float, W
-	RegTotalApparent = 1015 // float, VA
+	// Phase A (L1) - starting at register 0
+	RegPhaseAPower       = 0  // Active Power (W)
+	RegPhaseAApparent    = 2  // Apparent Power (VA)
+	RegPhaseACurrent     = 4  // Current (A)
+	RegPhaseAVoltage     = 6  // Voltage (V)
+	RegPhaseAPowerFactor = 8  // Power Factor
 
-	// Phase A (L1)
-	RegPhaseAVoltage     = 1020 // float, V
-	RegPhaseACurrent     = 1022 // float, A
-	RegPhaseAPower       = 1024 // float, W
-	RegPhaseAApparent    = 1026 // float, VA
-	RegPhaseAPowerFactor = 1028 // float
-	RegPhaseAFrequency   = 1033 // float, Hz
+	// Phase B (L2) - starting at register 10
+	RegPhaseBPower       = 10 // Active Power (W)
+	RegPhaseBApparent    = 12 // Apparent Power (VA)
+	RegPhaseBCurrent     = 14 // Current (A)
+	RegPhaseBVoltage     = 16 // Voltage (V)
+	RegPhaseBPowerFactor = 18 // Power Factor
 
-	// Phase B (L2) - offset 20 from Phase A
-	RegPhaseBVoltage     = 1040
-	RegPhaseBCurrent     = 1042
-	RegPhaseBPower       = 1044
-	RegPhaseBApparent    = 1046
-	RegPhaseBPowerFactor = 1048
-	RegPhaseBFrequency   = 1053
+	// Phase C (L3) - starting at register 20
+	RegPhaseCPower       = 20 // Active Power (W)
+	RegPhaseCApparent    = 22 // Apparent Power (VA)
+	RegPhaseCCurrent     = 24 // Current (A)
+	RegPhaseCVoltage     = 26 // Voltage (V)
+	RegPhaseCPowerFactor = 28 // Power Factor
 
-	// Phase C (L3) - offset 40 from Phase A
-	RegPhaseCVoltage     = 1060
-	RegPhaseCCurrent     = 1062
-	RegPhaseCPower       = 1064
-	RegPhaseCApparent    = 1066
-	RegPhaseCPowerFactor = 1068
-	RegPhaseCFrequency   = 1073
-
-	// Energy counters
-	RegForwardEnergy = 1162 // float, kWh (imported from grid)
-	RegReverseEnergy = 1164 // float, kWh (exported to grid)
+	// Total values - starting at register 30
+	RegTotalPower    = 30 // Total Active Power (W)
+	RegTotalApparent = 32 // Total Apparent Power (VA)
+	RegTotalCurrent  = 34 // Total Current (A)
 )
 
 // EM3 represents a Shelly Pro EM3 energy meter
@@ -201,56 +194,38 @@ func (e *EM3) pollLoop() {
 func (e *EM3) readAll() *core.GridData {
 	data := &core.GridData{Valid: true}
 
-	// Read total values (registers 31011-31016, 6 registers = 3 floats)
-	totals, err := e.client.ReadInputRegisters(e.unitID, RegTotalCurrent, 6)
+	// Read all data in one request (registers 0-35, 36 registers = 18 floats)
+	// This is more efficient than multiple requests
+	allRegs, err := e.client.ReadInputRegisters(e.unitID, 0, 36)
 	if err != nil {
-		log.Printf("shelly: read totals error: %v", err)
+		log.Printf("shelly: read all error: %v", err)
 		return &core.GridData{Valid: false, Error: err.Error()}
 	}
-	data.TotalCurrent = RegistersToFloat32(totals, 0)  // 31011-31012
-	data.TotalPower = RegistersToFloat32(totals, 2)    // 31013-31014
-	data.TotalApparent = RegistersToFloat32(totals, 4) // 31015-31016
 
-	// Read Phase A (registers 31020-31034)
-	phaseA, err := e.client.ReadInputRegisters(e.unitID, RegPhaseAVoltage, 14)
-	if err != nil {
-		log.Printf("shelly: read phase A error: %v", err)
-		data.Valid = false
-		data.Error = err.Error()
-		return data
-	}
-	data.Phases[0] = parsePhaseData(phaseA)
+	// Parse Phase A (registers 0-9)
+	data.Phases[0] = parsePhaseData(allRegs, 0)
 
-	// Read Phase B
-	phaseB, err := e.client.ReadInputRegisters(e.unitID, RegPhaseBVoltage, 14)
-	if err != nil {
-		log.Printf("shelly: read phase B error: %v", err)
-		data.Valid = false
-		data.Error = err.Error()
-		return data
-	}
-	data.Phases[1] = parsePhaseData(phaseB)
+	// Parse Phase B (registers 10-19)
+	data.Phases[1] = parsePhaseData(allRegs, 10)
 
-	// Read Phase C
-	phaseC, err := e.client.ReadInputRegisters(e.unitID, RegPhaseCVoltage, 14)
-	if err != nil {
-		log.Printf("shelly: read phase C error: %v", err)
-		data.Valid = false
-		data.Error = err.Error()
-		return data
-	}
-	data.Phases[2] = parsePhaseData(phaseC)
+	// Parse Phase C (registers 20-29)
+	data.Phases[2] = parsePhaseData(allRegs, 20)
+
+	// Parse totals (registers 30-35)
+	data.TotalPower = RegistersToFloat32(allRegs, 30)    // Total Active Power
+	data.TotalApparent = RegistersToFloat32(allRegs, 32) // Total Apparent Power
+	data.TotalCurrent = RegistersToFloat32(allRegs, 34)  // Total Current
 
 	return data
 }
 
-func parsePhaseData(regs []uint16) core.PhaseData {
+func parsePhaseData(regs []uint16, offset int) core.PhaseData {
 	return core.PhaseData{
-		Voltage:       RegistersToFloat32(regs, 0),  // offset 0-1
-		Current:       RegistersToFloat32(regs, 2),  // offset 2-3
-		ActivePower:   RegistersToFloat32(regs, 4),  // offset 4-5
-		ApparentPower: RegistersToFloat32(regs, 6),  // offset 6-7
-		PowerFactor:   RegistersToFloat32(regs, 8),  // offset 8-9
-		Frequency:     RegistersToFloat32(regs, 12), // offset 12-13 (skip 10-11)
+		ActivePower:   RegistersToFloat32(regs, offset+0), // Power (W)
+		ApparentPower: RegistersToFloat32(regs, offset+2), // Apparent (VA)
+		Current:       RegistersToFloat32(regs, offset+4), // Current (A)
+		Voltage:       RegistersToFloat32(regs, offset+6), // Voltage (V)
+		PowerFactor:   RegistersToFloat32(regs, offset+8), // Power Factor
+		Frequency:     50.0,                               // Not provided, assume 50Hz
 	}
 }
