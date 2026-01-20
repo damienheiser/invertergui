@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,11 +22,14 @@ type BMV struct {
 	portPath string
 	baudRate int
 
-	mu     sync.RWMutex
-	data   core.BatteryData
-	raw    map[string]string
-	valid  bool
-	lastRx time.Time
+	mu           sync.RWMutex
+	data         core.BatteryData
+	raw          map[string]string
+	valid        bool
+	lastRx       time.Time
+	connected    bool
+	lastError    string
+	reconnecting bool
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -41,6 +45,20 @@ func NewBMV(portPath string) *BMV {
 	}
 }
 
+// Connected returns true if currently connected
+func (b *BMV) Connected() bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.connected
+}
+
+// LastError returns the last error message
+func (b *BMV) LastError() string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.lastError
+}
+
 // Connect opens the serial port and starts reading data
 func (b *BMV) Connect() error {
 	port, err := serial.OpenPort(&serial.Config{
@@ -49,9 +67,18 @@ func (b *BMV) Connect() error {
 		ReadTimeout: time.Second,
 	})
 	if err != nil {
+		b.mu.Lock()
+		b.lastError = err.Error()
+		b.connected = false
+		b.mu.Unlock()
 		return fmt.Errorf("failed to open BMV port %s: %w", b.portPath, err)
 	}
 	b.port = port
+
+	b.mu.Lock()
+	b.connected = true
+	b.lastError = ""
+	b.mu.Unlock()
 
 	b.wg.Add(1)
 	go b.readLoop()
@@ -98,9 +125,8 @@ func (b *BMV) RawData() map[string]string {
 func (b *BMV) readLoop() {
 	defer b.wg.Done()
 
-	reader := bufio.NewReader(b.port)
-	block := make(map[string]string)
-	var checksum byte
+	consecutiveErrors := 0
+	const maxErrors = 10
 
 	for {
 		select {
@@ -109,50 +135,114 @@ func (b *BMV) readLoop() {
 		default:
 		}
 
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err != io.EOF {
-				time.Sleep(100 * time.Millisecond)
-			}
-			continue
-		}
+		b.mu.RLock()
+		connected := b.connected
+		port := b.port
+		b.mu.RUnlock()
 
-		// Add all bytes to checksum (including CR LF)
-		for i := 0; i < len(line); i++ {
-			checksum += line[i]
-		}
-
-		// Trim CR LF
-		line = strings.TrimRight(line, "\r\n")
-		if line == "" {
-			continue
-		}
-
-		// Split on tab
-		parts := strings.SplitN(line, "\t", 2)
-		if len(parts) != 2 {
-			continue
-		}
-
-		label := parts[0]
-		value := parts[1]
-
-		if label == "Checksum" {
-			// Checksum byte is the value
-			if len(value) > 0 {
-				checksum += value[0]
+		if !connected || port == nil {
+			// Wait before attempting reconnection
+			select {
+			case <-time.After(5 * time.Second):
+			case <-b.stopCh:
+				return
 			}
 
-			// Valid block if checksum mod 256 == 0
-			if checksum == 0 {
-				b.processBlock(block)
+			log.Printf("bmv: attempting reconnection to %s...", b.portPath)
+			port, err := serial.OpenPort(&serial.Config{
+				Name:        b.portPath,
+				Baud:        b.baudRate,
+				ReadTimeout: time.Second,
+			})
+			if err != nil {
+				b.mu.Lock()
+				b.lastError = err.Error()
+				b.mu.Unlock()
+				log.Printf("bmv: reconnection failed: %v", err)
+				continue
 			}
 
-			// Reset for next block
-			block = make(map[string]string)
-			checksum = 0
-		} else {
-			block[label] = value
+			b.mu.Lock()
+			b.port = port
+			b.connected = true
+			b.lastError = ""
+			b.mu.Unlock()
+			log.Printf("bmv: reconnected to %s", b.portPath)
+			consecutiveErrors = 0
+		}
+
+		reader := bufio.NewReader(b.port)
+		block := make(map[string]string)
+		var checksum byte
+
+		// Read loop for a connected port
+		for {
+			select {
+			case <-b.stopCh:
+				return
+			default:
+			}
+
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				if err != io.EOF {
+					consecutiveErrors++
+					if consecutiveErrors >= maxErrors {
+						b.mu.Lock()
+						b.connected = false
+						b.lastError = err.Error()
+						b.valid = false
+						b.mu.Unlock()
+						log.Printf("bmv: disconnected after %d errors: %v", consecutiveErrors, err)
+						if b.port != nil {
+							b.port.Close()
+						}
+						break // Break inner loop to attempt reconnection
+					}
+					time.Sleep(100 * time.Millisecond)
+				}
+				continue
+			}
+
+			consecutiveErrors = 0 // Reset error count on successful read
+
+			// Add all bytes to checksum (including CR LF)
+			for i := 0; i < len(line); i++ {
+				checksum += line[i]
+			}
+
+			// Trim CR LF
+			line = strings.TrimRight(line, "\r\n")
+			if line == "" {
+				continue
+			}
+
+			// Split on tab
+			parts := strings.SplitN(line, "\t", 2)
+			if len(parts) != 2 {
+				continue
+			}
+
+			label := parts[0]
+			value := parts[1]
+
+			if label == "Checksum" {
+				// Checksum byte is the value
+				if len(value) > 0 {
+					checksum += value[0]
+				}
+
+				// Valid block if checksum mod 256 == 0
+				if checksum == 0 {
+					b.processBlock(block)
+				}
+
+				// Reset for next block
+				block = make(map[string]string)
+				checksum = 0
+			} else {
+				block[label] = value
+			}
 		}
 	}
 }

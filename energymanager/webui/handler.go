@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,14 +20,33 @@ import (
 )
 
 
+// InitStatus tracks initialization progress
+type InitStatus struct {
+	Stage       string `json:"stage"`
+	Description string `json:"description"`
+	Ready       bool   `json:"ready"`
+	Error       string `json:"error,omitempty"`
+}
+
+// ServiceCallbacks holds callbacks for runtime service reconfiguration
+type ServiceCallbacks struct {
+	// ReconfigureMQTT is called when MQTT config changes
+	// Returns error if reconfiguration fails
+	ReconfigureMQTT func(enabled bool, broker, topic, clientID, username, password string) error
+	// ReconfigureInfluxDB is called when InfluxDB config changes
+	ReconfigureInfluxDB func(enabled bool, url, database, username, password, token, org string, interval time.Duration) error
+}
+
 // Handler serves the web UI
 type Handler struct {
-	hub       *core.Hub
-	modeCtrl  *modes.Controller
-	config    *Config
-	auth      *auth.Authenticator
-	mu        sync.RWMutex
-	latest    *core.EnergyInfo
+	hub        *core.Hub
+	modeCtrl   *modes.Controller
+	config     *Config
+	auth       *auth.Authenticator
+	callbacks  *ServiceCallbacks
+	mu         sync.RWMutex
+	latest     *core.EnergyInfo
+	initStatus *InitStatus
 }
 
 // Config holds runtime configuration
@@ -59,6 +80,24 @@ type Config struct {
 	// Auth config (for protected endpoints)
 	Username string `json:"username,omitempty"`
 	Password string `json:"password,omitempty"`
+
+	// MQTT config
+	MQTTEnabled  bool   `json:"mqtt_enabled"`
+	MQTTBroker   string `json:"mqtt_broker"`
+	MQTTTopic    string `json:"mqtt_topic"`
+	MQTTClientID string `json:"mqtt_client_id"`
+	MQTTUsername string `json:"mqtt_username,omitempty"`
+	MQTTPassword string `json:"mqtt_password,omitempty"`
+
+	// InfluxDB config
+	InfluxEnabled  bool          `json:"influx_enabled"`
+	InfluxURL      string        `json:"influx_url"`
+	InfluxDatabase string        `json:"influx_database"`
+	InfluxUsername string        `json:"influx_username,omitempty"`
+	InfluxPassword string        `json:"influx_password,omitempty"`
+	InfluxToken    string        `json:"influx_token,omitempty"`
+	InfluxOrg      string        `json:"influx_org,omitempty"`
+	InfluxInterval time.Duration `json:"influx_interval"`
 }
 
 // New creates a new web UI handler
@@ -68,9 +107,40 @@ func New(hub *core.Hub, modeCtrl *modes.Controller, cfg *Config) *Handler {
 		modeCtrl: modeCtrl,
 		config:   cfg,
 		auth:     auth.New(cfg.Username, cfg.Password), // Fallback to config if system auth fails
+		initStatus: &InitStatus{
+			Stage:       "starting",
+			Description: "Starting Energy Manager...",
+			Ready:       false,
+		},
 	}
 	go h.updateLoop()
 	return h
+}
+
+// SetCallbacks sets the service reconfiguration callbacks
+func (h *Handler) SetCallbacks(cb *ServiceCallbacks) {
+	h.mu.Lock()
+	h.callbacks = cb
+	h.mu.Unlock()
+}
+
+// SetInitStatus updates the initialization status
+func (h *Handler) SetInitStatus(stage, description string, ready bool, err string) {
+	h.mu.Lock()
+	h.initStatus = &InitStatus{
+		Stage:       stage,
+		Description: description,
+		Ready:       ready,
+		Error:       err,
+	}
+	h.mu.Unlock()
+}
+
+// GetInitStatus returns the current initialization status
+func (h *Handler) GetInitStatus() *InitStatus {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.initStatus
 }
 
 func (h *Handler) updateLoop() {
@@ -102,6 +172,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	// Public endpoints - no auth required
 	mux.HandleFunc("/", h.serveDashboard)
 	mux.HandleFunc("/api/status", h.serveStatus)
+	mux.HandleFunc("/api/init", h.handleInitStatus)
 
 	// Protected endpoints - require authentication
 	mux.HandleFunc("/config", h.requireAuth(h.serveConfig))
@@ -112,6 +183,14 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/tou", h.requireAuth(h.handleTOU))
 	mux.HandleFunc("/api/schedule", h.requireAuth(h.handleSchedule))
 	mux.HandleFunc("/api/ports", h.requireAuth(h.handlePorts))
+}
+
+func (h *Handler) handleInitStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	h.mu.RLock()
+	status := h.initStatus
+	h.mu.RUnlock()
+	json.NewEncoder(w).Encode(status)
 }
 
 func (h *Handler) serveDashboard(w http.ResponseWriter, r *http.Request) {
@@ -160,13 +239,71 @@ func (h *Handler) handleConfig(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+
+		// Check if MQTT config changed
+		mqttChanged := h.config.MQTTEnabled != cfg.MQTTEnabled ||
+			h.config.MQTTBroker != cfg.MQTTBroker ||
+			h.config.MQTTTopic != cfg.MQTTTopic ||
+			h.config.MQTTClientID != cfg.MQTTClientID ||
+			h.config.MQTTUsername != cfg.MQTTUsername ||
+			h.config.MQTTPassword != cfg.MQTTPassword
+
+		// Check if InfluxDB config changed
+		influxChanged := h.config.InfluxEnabled != cfg.InfluxEnabled ||
+			h.config.InfluxURL != cfg.InfluxURL ||
+			h.config.InfluxDatabase != cfg.InfluxDatabase ||
+			h.config.InfluxUsername != cfg.InfluxUsername ||
+			h.config.InfluxPassword != cfg.InfluxPassword ||
+			h.config.InfluxToken != cfg.InfluxToken ||
+			h.config.InfluxOrg != cfg.InfluxOrg ||
+			h.config.InfluxInterval != cfg.InfluxInterval
+
 		h.config = &cfg
+
 		// Apply config to mode controller
 		if h.modeCtrl != nil {
 			h.modeCtrl.SetTOUSchedule(cfg.TOUSchedule)
 			h.modeCtrl.SetSolarConfig(cfg.SolarConfig)
 			h.modeCtrl.SetBatterySaveConfig(cfg.BatterySaveConfig)
 			h.modeCtrl.SetModeSchedule(cfg.ModeSchedule)
+		}
+
+		// Apply MQTT config change
+		if mqttChanged && h.callbacks != nil && h.callbacks.ReconfigureMQTT != nil {
+			if err := h.callbacks.ReconfigureMQTT(
+				cfg.MQTTEnabled,
+				cfg.MQTTBroker,
+				cfg.MQTTTopic,
+				cfg.MQTTClientID,
+				cfg.MQTTUsername,
+				cfg.MQTTPassword,
+			); err != nil {
+				json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": "MQTT: " + err.Error()})
+				return
+			}
+		}
+
+		// Apply InfluxDB config change
+		if influxChanged && h.callbacks != nil && h.callbacks.ReconfigureInfluxDB != nil {
+			if err := h.callbacks.ReconfigureInfluxDB(
+				cfg.InfluxEnabled,
+				cfg.InfluxURL,
+				cfg.InfluxDatabase,
+				cfg.InfluxUsername,
+				cfg.InfluxPassword,
+				cfg.InfluxToken,
+				cfg.InfluxOrg,
+				cfg.InfluxInterval,
+			); err != nil {
+				json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": "InfluxDB: " + err.Error()})
+				return
+			}
+		}
+
+		// Persist to UCI config
+		if err := h.saveToUCI(&cfg); err != nil {
+			json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": err.Error()})
+			return
 		}
 		w.Write([]byte(`{"status":"ok"}`))
 		return
@@ -356,12 +493,110 @@ func (h *Handler) handleTOU(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 }
 
+// saveToUCI persists the configuration to /etc/config/energymanager using UCI
+func (h *Handler) saveToUCI(cfg *Config) error {
+	// Check if UCI is available (OpenWRT)
+	if _, err := exec.LookPath("uci"); err != nil {
+		// Not on OpenWRT, skip UCI persistence
+		return nil
+	}
+
+	// Helper to run uci commands
+	uci := func(args ...string) error {
+		cmd := exec.Command("uci", args...)
+		return cmd.Run()
+	}
+
+	// Set main config
+	uci("set", "energymanager.main.shelly_addr="+cfg.ShellyAddr)
+	uci("set", "energymanager.victron.port="+cfg.VictronPort)
+	uci("set", "energymanager.bmv.port="+cfg.BMVPort)
+	uci("set", "energymanager.victron.maxpower="+strconv.FormatFloat(cfg.MaxPower, 'f', 0, 64))
+	uci("set", "energymanager.battery.capacity="+strconv.FormatFloat(cfg.BatteryCapacity, 'f', 1, 64))
+	uci("set", "energymanager.location.latitude="+strconv.FormatFloat(cfg.Latitude, 'f', 6, 64))
+	uci("set", "energymanager.location.longitude="+strconv.FormatFloat(cfg.Longitude, 'f', 6, 64))
+
+	// PID config
+	uci("set", "energymanager.pid.kp="+strconv.FormatFloat(cfg.PIDKp, 'f', 2, 64))
+	uci("set", "energymanager.pid.ki="+strconv.FormatFloat(cfg.PIDKi, 'f', 2, 64))
+	uci("set", "energymanager.pid.kd="+strconv.FormatFloat(cfg.PIDKd, 'f', 2, 64))
+	uci("set", "energymanager.pid.setpoint="+strconv.FormatFloat(cfg.PIDSetpoint, 'f', 0, 64))
+
+	// Solar config
+	zeroExport := "0"
+	if cfg.SolarConfig.ZeroExport {
+		zeroExport = "1"
+	}
+	uci("set", "energymanager.solar.zero_export="+zeroExport)
+	uci("set", "energymanager.solar.export_limit="+strconv.FormatFloat(cfg.SolarConfig.ExportLimit, 'f', 0, 64))
+	uci("set", "energymanager.solar.min_soc="+strconv.FormatFloat(cfg.SolarConfig.MinSOC, 'f', 0, 64))
+	uci("set", "energymanager.solar.max_soc="+strconv.FormatFloat(cfg.SolarConfig.MaxSOC, 'f', 0, 64))
+
+	// Battery save config
+	uci("set", "energymanager.battery_save.min_soc="+strconv.FormatFloat(cfg.BatterySaveConfig.MinSOC, 'f', 0, 64))
+	uci("set", "energymanager.battery_save.target_soc_sunrise="+strconv.FormatFloat(cfg.BatterySaveConfig.TargetSOC, 'f', 0, 64))
+	uci("set", "energymanager.battery_save.sunrise_offset_minutes="+strconv.Itoa(cfg.BatterySaveConfig.SunriseOffset))
+
+	// Mode schedule - store as JSON
+	if scheduleJSON, err := json.Marshal(cfg.ModeSchedule); err == nil {
+		scheduleEnabled := "0"
+		if cfg.ModeSchedule.Enabled {
+			scheduleEnabled = "1"
+		}
+		uci("set", "energymanager.schedule.enabled="+scheduleEnabled)
+		// Store periods as JSON in a single option
+		if len(cfg.ModeSchedule.Periods) > 0 {
+			uci("set", "energymanager.schedule.periods="+string(scheduleJSON))
+		}
+	}
+
+	// MQTT config
+	mqttEnabled := "0"
+	if cfg.MQTTEnabled {
+		mqttEnabled = "1"
+	}
+	uci("set", "energymanager.mqtt.enabled="+mqttEnabled)
+	uci("set", "energymanager.mqtt.broker="+cfg.MQTTBroker)
+	uci("set", "energymanager.mqtt.topic="+cfg.MQTTTopic)
+	uci("set", "energymanager.mqtt.client_id="+cfg.MQTTClientID)
+	uci("set", "energymanager.mqtt.username="+cfg.MQTTUsername)
+	uci("set", "energymanager.mqtt.password="+cfg.MQTTPassword)
+
+	// InfluxDB config
+	influxEnabled := "0"
+	if cfg.InfluxEnabled {
+		influxEnabled = "1"
+	}
+	uci("set", "energymanager.influxdb.enabled="+influxEnabled)
+	uci("set", "energymanager.influxdb.url="+cfg.InfluxURL)
+	uci("set", "energymanager.influxdb.database="+cfg.InfluxDatabase)
+	uci("set", "energymanager.influxdb.username="+cfg.InfluxUsername)
+	uci("set", "energymanager.influxdb.password="+cfg.InfluxPassword)
+	uci("set", "energymanager.influxdb.token="+cfg.InfluxToken)
+	uci("set", "energymanager.influxdb.org="+cfg.InfluxOrg)
+	uci("set", "energymanager.influxdb.interval="+cfg.InfluxInterval.String())
+
+	// Commit changes
+	if err := uci("commit", "energymanager"); err != nil {
+		return fmt.Errorf("uci commit failed: %w", err)
+	}
+
+	return nil
+}
+
 func (h *Handler) dashboardHTML(info *core.EnergyInfo) string {
 	gridPower := "---"
 	gridClass := ""
+	gridStatus := "Offline"
+	gridStatusClass := "offline"
+	gridError := ""
 	phaseHTML := ""
 	invState := "---"
 	invPower := "---"
+	invACInVoltage := "---"
+	invACInCurrent := "---"
+	invACOutVoltage := "---"
+	invACOutCurrent := "---"
 	batVoltage := "---"
 	batSOC := "---"
 	batCurrent := "---"
@@ -370,10 +605,21 @@ func (h *Handler) dashboardHTML(info *core.EnergyInfo) string {
 	batDischargedKWh := "---"
 	batTimeToGo := "---"
 	batProduct := "---"
+	batConsumedAh := "---"
+	batChargeCycles := "---"
+	batMinVoltage := "---"
+	batMaxVoltage := "---"
+	batTimeSinceFullCharge := "---"
+	batTemperature := "---"
+	batAlarm := ""
+	batFirmware := "---"
+	batSerial := "---"
 	bmvConnected := false
 	modeStr := "---"
 	modeDesc := "---"
 	pidOutput := "---"
+	overrideValue := 0
+	overrideActive := false
 	timestamp := "---"
 
 	if info != nil {
@@ -381,6 +627,8 @@ func (h *Handler) dashboardHTML(info *core.EnergyInfo) string {
 
 		if info.Grid.Valid {
 			gridPower = fmt.Sprintf("%.0f W", info.Grid.TotalPower)
+			gridStatus = "Online"
+			gridStatusClass = "online"
 			if info.Grid.TotalPower > 50 {
 				gridClass = "importing"
 			} else if info.Grid.TotalPower < -50 {
@@ -392,11 +640,14 @@ func (h *Handler) dashboardHTML(info *core.EnergyInfo) string {
 				phaseHTML += fmt.Sprintf(`
 				<div class="phase">
 					<div class="phase-label">Phase %c</div>
-					<div>%.1f V</div>
-					<div>%.2f A</div>
-					<div>%.0f W</div>
-				</div>`, 'A'+i, p.Voltage, p.Current, p.ActivePower)
+					<div class="phase-main">%.1f V | %.2f A | %.0f W</div>
+					<div class="phase-detail">%.0f VA | PF: %.2f | %.1f Hz</div>
+				</div>`, 'A'+i, p.Voltage, p.Current, p.ActivePower, p.ApparentPower, p.PowerFactor, p.Frequency)
 			}
+		} else if info.Grid.Error != "" {
+			gridError = info.Grid.Error
+			gridStatus = "Error"
+			gridStatusClass = "error"
 		}
 
 		if info.Inverter.Valid {
@@ -404,6 +655,14 @@ func (h *Handler) dashboardHTML(info *core.EnergyInfo) string {
 			invPower = fmt.Sprintf("%.0f W", info.Inverter.BatPower)
 			batVoltage = fmt.Sprintf("%.1f V", info.Inverter.BatVoltage)
 			batSOC = fmt.Sprintf("%.0f%%", info.Inverter.BatSOC)
+			if info.Inverter.ACInVoltage > 0 {
+				invACInVoltage = fmt.Sprintf("%.1f V", info.Inverter.ACInVoltage)
+				invACInCurrent = fmt.Sprintf("%.1f A", info.Inverter.ACInCurrent)
+			}
+			if info.Inverter.ACOutVoltage > 0 {
+				invACOutVoltage = fmt.Sprintf("%.1f V", info.Inverter.ACOutVoltage)
+				invACOutCurrent = fmt.Sprintf("%.1f A", info.Inverter.ACOutCurrent)
+			}
 		}
 
 		// Battery monitor data (from BMV via VE.Direct)
@@ -415,6 +674,10 @@ func (h *Handler) dashboardHTML(info *core.EnergyInfo) string {
 			batSOC = fmt.Sprintf("%.1f%%", info.Battery.SOCPercent)
 			batChargedKWh = fmt.Sprintf("%.2f kWh", info.Battery.ChargedKWh)
 			batDischargedKWh = fmt.Sprintf("%.2f kWh", info.Battery.DischargedKWh)
+			batConsumedAh = fmt.Sprintf("%.2f Ah", info.Battery.ConsumedAh)
+			batChargeCycles = fmt.Sprintf("%d", info.Battery.ChargeCycles)
+			batMinVoltage = fmt.Sprintf("%.2f V", info.Battery.MinVoltageV)
+			batMaxVoltage = fmt.Sprintf("%.2f V", info.Battery.MaxVoltageV)
 			if info.Battery.TimeToGoMin > 0 {
 				hours := info.Battery.TimeToGoMin / 60
 				mins := info.Battery.TimeToGoMin % 60
@@ -422,12 +685,27 @@ func (h *Handler) dashboardHTML(info *core.EnergyInfo) string {
 			} else if info.Battery.TimeToGoMin == -1 {
 				batTimeToGo = "Infinite"
 			}
+			if info.Battery.SecondsSinceFullCharge > 0 {
+				hours := info.Battery.SecondsSinceFullCharge / 3600
+				mins := (info.Battery.SecondsSinceFullCharge % 3600) / 60
+				batTimeSinceFullCharge = fmt.Sprintf("%dh %dm", hours, mins)
+			}
+			if info.Battery.HasTemperature {
+				batTemperature = fmt.Sprintf("%.1f°C", info.Battery.TemperatureC)
+			}
+			if info.Battery.AlarmActive {
+				batAlarm = info.Battery.AlarmReason
+			}
 			batProduct = info.Battery.ProductName
+			batFirmware = info.Battery.FirmwareVersion
+			batSerial = info.Battery.SerialNumber
 		}
 
 		modeStr = string(info.Mode.Current)
 		modeDesc = info.Mode.Description
 		pidOutput = fmt.Sprintf("%.0f W", info.PID.Output)
+		overrideValue = int(info.Mode.OverrideVal)
+		overrideActive = info.Mode.Override
 	}
 
 	bmvClass := ""
@@ -453,24 +731,41 @@ func (h *Handler) dashboardHTML(info *core.EnergyInfo) string {
         <a href="/config">Config</a>
         <a href="/metrics">Metrics</a>
         <a id="luci-link" href="/cgi-bin/luci/" target="_blank">LuCI</a>
+        <a id="glinet-link" href="/" target="_blank">GL.iNet</a>
     </div>
 </nav>
+
+<div id="init-status" class="init-status">
+    <div class="init-spinner"></div>
+    <span id="init-message">Initializing...</span>
+</div>
 
 <main class="container">
     <div class="grid-container">
         <div class="card grid-card">
-            <h2>Grid Power</h2>
+            <div class="card-header">
+                <h2>Grid Power</h2>
+                <span class="status-badge %s">%s</span>
+            </div>
             <div class="big %s" id="grid-power">%s</div>
+            <div class="grid-error" id="grid-error">%s</div>
             <div class="phases">%s</div>
         </div>
 
         <div class="card inverter-card">
             <h2>Inverter</h2>
             <div class="stat-row"><span>State:</span><span id="inv-state">%s</span></div>
-            <div class="stat-row"><span>Power:</span><span id="inv-power">%s</span></div>
-            <div class="stat-row"><span>Battery:</span><span id="bat-voltage">%s</span></div>
+            <div class="stat-row"><span>Battery Power:</span><span id="inv-power">%s</span></div>
+            <div class="stat-row"><span>Battery Voltage:</span><span id="bat-voltage">%s</span></div>
             <div class="stat-row"><span>SOC:</span><span id="bat-soc">%s</span></div>
             <div class="soc-bar"><div class="soc-fill" id="soc-fill" style="width:%s"></div></div>
+            <details class="details-section">
+                <summary>AC Details</summary>
+                <div class="stat-row"><span>AC In Voltage:</span><span id="inv-ac-in-v">%s</span></div>
+                <div class="stat-row"><span>AC In Current:</span><span id="inv-ac-in-a">%s</span></div>
+                <div class="stat-row"><span>AC Out Voltage:</span><span id="inv-ac-out-v">%s</span></div>
+                <div class="stat-row"><span>AC Out Current:</span><span id="inv-ac-out-a">%s</span></div>
+            </details>
         </div>
 
         <div class="card battery-card %s">
@@ -481,8 +776,26 @@ func (h *Handler) dashboardHTML(info *core.EnergyInfo) string {
             <div class="stat-row"><span>Power:</span><span id="bmv-power">%s</span></div>
             <div class="stat-row"><span>SOC:</span><span id="bmv-soc">%s</span></div>
             <div class="stat-row"><span>Time to Go:</span><span id="bmv-ttg">%s</span></div>
-            <div class="stat-row"><span>Charged:</span><span id="bmv-charged">%s</span></div>
-            <div class="stat-row"><span>Discharged:</span><span id="bmv-discharged">%s</span></div>
+            <div class="bmv-alarm" id="bmv-alarm">%s</div>
+            <details class="details-section">
+                <summary>Energy Totals</summary>
+                <div class="stat-row"><span>Charged:</span><span id="bmv-charged">%s</span></div>
+                <div class="stat-row"><span>Discharged:</span><span id="bmv-discharged">%s</span></div>
+                <div class="stat-row"><span>Consumed:</span><span id="bmv-consumed">%s</span></div>
+                <div class="stat-row"><span>Charge Cycles:</span><span id="bmv-cycles">%s</span></div>
+            </details>
+            <details class="details-section">
+                <summary>History</summary>
+                <div class="stat-row"><span>Min Voltage:</span><span id="bmv-min-v">%s</span></div>
+                <div class="stat-row"><span>Max Voltage:</span><span id="bmv-max-v">%s</span></div>
+                <div class="stat-row"><span>Since Full:</span><span id="bmv-since-full">%s</span></div>
+                <div class="stat-row"><span>Temperature:</span><span id="bmv-temp">%s</span></div>
+            </details>
+            <details class="details-section">
+                <summary>Device Info</summary>
+                <div class="stat-row"><span>Firmware:</span><span id="bmv-fw">%s</span></div>
+                <div class="stat-row"><span>Serial:</span><span id="bmv-serial">%s</span></div>
+            </details>
         </div>
 
         <div class="card mode-card">
@@ -500,8 +813,8 @@ func (h *Handler) dashboardHTML(info *core.EnergyInfo) string {
 
             <h3>Manual Override</h3>
             <div class="override-control">
-                <input type="range" id="override-slider" min="-5000" max="5000" value="0" oninput="updateOverrideDisplay()">
-                <span id="override-value">0 W</span>
+                <input type="range" id="override-slider" min="-5000" max="5000" value="%d" oninput="updateOverrideDisplay()">
+                <span id="override-value">%d W</span>
                 <button onclick="setOverride(true)">Apply</button>
                 <button onclick="setOverride(false)">Clear</button>
             </div>
@@ -525,17 +838,22 @@ func (h *Handler) dashboardHTML(info *core.EnergyInfo) string {
 </body>
 </html>`,
 		dashboardCSS(),
-		gridClass, gridPower, phaseHTML,
+		gridStatusClass, gridStatus, gridClass, gridPower, gridError, phaseHTML,
 		invState, invPower, batVoltage, batSOC, batSOC,
-		bmvClass, batProduct, batVoltage, batCurrent, batPower, batSOC, batTimeToGo, batChargedKWh, batDischargedKWh,
+		invACInVoltage, invACInCurrent, invACOutVoltage, invACOutCurrent,
+		bmvClass, batProduct, batVoltage, batCurrent, batPower, batSOC, batTimeToGo, batAlarm,
+		batChargedKWh, batDischargedKWh, batConsumedAh, batChargeCycles,
+		batMinVoltage, batMaxVoltage, batTimeSinceFullCharge, batTemperature,
+		batFirmware, batSerial,
 		modeButtonClass("scheduled", modeStr),
 		modeButtonClass("pid", modeStr),
 		modeButtonClass("tou", modeStr),
 		modeButtonClass("solar", modeStr),
 		modeButtonClass("battery_save", modeStr),
 		modeStr, modeDesc, pidOutput,
+		overrideValue, overrideValue,
 		timestamp,
-		dashboardJS(),
+		dashboardJS(overrideActive),
 	)
 }
 
@@ -558,6 +876,21 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .grid-container { display: grid; gap: 1.5rem; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
 .card { background: #1e293b; border-radius: 0.75rem; padding: 1.5rem; border: 1px solid #334155; }
 h2 { font-size: 1rem; color: #94a3b8; margin-bottom: 1rem; text-transform: uppercase; letter-spacing: 0.05em; }
+.card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
+.card-header h2 { margin-bottom: 0; }
+.status-badge { font-size: 0.75rem; padding: 0.25rem 0.5rem; border-radius: 0.25rem; font-weight: 500; }
+.status-badge.online { background: #065f46; color: #6ee7b7; }
+.status-badge.offline { background: #7f1d1d; color: #fca5a5; }
+.status-badge.error { background: #78350f; color: #fcd34d; }
+.grid-error { font-size: 0.75rem; color: #fca5a5; margin-bottom: 0.5rem; word-break: break-all; }
+.details-section { margin-top: 0.75rem; border-top: 1px solid #334155; padding-top: 0.5rem; }
+.details-section summary { cursor: pointer; color: #64748b; font-size: 0.875rem; padding: 0.5rem 0; }
+.details-section summary:hover { color: #94a3b8; }
+.details-section[open] summary { color: #38bdf8; }
+.phase-main { font-size: 0.875rem; }
+.phase-detail { font-size: 0.75rem; color: #64748b; margin-top: 0.25rem; }
+.bmv-alarm { color: #f87171; font-size: 0.875rem; padding: 0.5rem; background: #7f1d1d; border-radius: 0.25rem; margin: 0.5rem 0; }
+.bmv-alarm:empty { display: none; }
 h3 { font-size: 0.875rem; color: #64748b; margin: 1rem 0 0.5rem; }
 .big { font-size: 3rem; font-weight: 700; line-height: 1; margin-bottom: 1rem; }
 .importing { color: #f87171; }
@@ -586,6 +919,11 @@ h3 { font-size: 0.875rem; color: #64748b; margin: 1rem 0 0.5rem; }
 .link-button { display: block; padding: 0.75rem 1rem; background: #334155; color: #f8fafc; text-decoration: none; border-radius: 0.375rem; margin-bottom: 0.5rem; text-align: center; transition: background 0.2s; }
 .link-button:hover { background: #475569; }
 .timestamp { text-align: center; color: #64748b; font-size: 0.75rem; margin-top: 2rem; }
+.init-status { background: #1e3a5f; padding: 1rem 2rem; display: flex; align-items: center; gap: 1rem; border-bottom: 1px solid #334155; }
+.init-status.ready { display: none; }
+.init-spinner { width: 20px; height: 20px; border: 3px solid #334155; border-top-color: #38bdf8; border-radius: 50%; animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+#init-message { color: #94a3b8; }
 @media (max-width: 600px) {
     .navbar { flex-direction: column; gap: 1rem; }
     .nav-links { display: flex; flex-wrap: wrap; justify-content: center; }
@@ -595,16 +933,46 @@ h3 { font-size: 0.875rem; color: #64748b; margin: 1rem 0 0.5rem; }
 `
 }
 
-func dashboardJS() string {
-	return `
-// Fix LuCI links to use port 80 (nginx) instead of current port
+func dashboardJS(overrideActive bool) string {
+	overrideActiveJS := "false"
+	if overrideActive {
+		overrideActiveJS = "true"
+	}
+	return fmt.Sprintf(`
+// Override state tracking
+var overrideActive = %s;
+
+// Fix navigation links to use port 80 (nginx) instead of current port
 (function() {
-    var luciBase = window.location.protocol + '//' + window.location.hostname;
-    var luciLinks = document.querySelectorAll('#luci-link, #luci-admin-link');
-    luciLinks.forEach(function(link) {
-        link.href = luciBase + '/cgi-bin/luci/';
-    });
+    var baseURL = window.location.protocol + '//' + window.location.hostname;
+
+    // LuCI link
+    var luciLink = document.getElementById('luci-link');
+    if (luciLink) luciLink.href = baseURL + '/cgi-bin/luci/';
+
+    // GL.iNet link (main admin interface)
+    var glinetLink = document.getElementById('glinet-link');
+    if (glinetLink) glinetLink.href = baseURL + '/';
 })();
+
+// Check initialization status
+function checkInitStatus() {
+    fetch('/api/init')
+        .then(r => r.json())
+        .then(status => {
+            var el = document.getElementById('init-status');
+            var msg = document.getElementById('init-message');
+            if (status.ready) {
+                el.style.display = 'none';
+            } else {
+                el.style.display = 'flex';
+                msg.textContent = status.description || 'Initializing...';
+            }
+        })
+        .catch(() => {});
+}
+checkInitStatus();
+setInterval(checkInitStatus, 2000);
 
 function setMode(mode) {
     fetch('/api/mode', {
@@ -634,8 +1002,20 @@ setInterval(() => {
     fetch('/api/status')
         .then(r => r.json())
         .then(data => {
-            if (data.grid && data.grid.valid) {
-                document.getElementById('grid-power').textContent = Math.round(data.grid.total_power_w) + ' W';
+            if (data.grid) {
+                var gridBadge = document.querySelector('.grid-card .status-badge');
+                var gridError = document.getElementById('grid-error');
+                if (data.grid.valid) {
+                    document.getElementById('grid-power').textContent = Math.round(data.grid.total_power_w) + ' W';
+                    gridBadge.className = 'status-badge online';
+                    gridBadge.textContent = 'Online';
+                    gridError.textContent = '';
+                } else {
+                    document.getElementById('grid-power').textContent = '---';
+                    gridBadge.className = 'status-badge ' + (data.grid.error ? 'error' : 'offline');
+                    gridBadge.textContent = data.grid.error ? 'Error' : 'Offline';
+                    gridError.textContent = data.grid.error || '';
+                }
             }
             if (data.inverter && data.inverter.valid) {
                 document.getElementById('inv-state').textContent = data.inverter.state;
@@ -643,6 +1023,14 @@ setInterval(() => {
                 document.getElementById('bat-voltage').textContent = data.inverter.bat_voltage_v.toFixed(1) + ' V';
                 document.getElementById('bat-soc').textContent = Math.round(data.inverter.bat_soc_pct) + '%';
                 document.getElementById('soc-fill').style.width = data.inverter.bat_soc_pct + '%';
+                if (data.inverter.ac_in_voltage_v > 0) {
+                    document.getElementById('inv-ac-in-v').textContent = data.inverter.ac_in_voltage_v.toFixed(1) + ' V';
+                    document.getElementById('inv-ac-in-a').textContent = data.inverter.ac_in_current_a.toFixed(1) + ' A';
+                }
+                if (data.inverter.ac_out_voltage_v > 0) {
+                    document.getElementById('inv-ac-out-v').textContent = data.inverter.ac_out_voltage_v.toFixed(1) + ' V';
+                    document.getElementById('inv-ac-out-a').textContent = data.inverter.ac_out_current_a.toFixed(1) + ' A';
+                }
             }
             if (data.battery && data.battery.valid) {
                 document.querySelector('.battery-card').classList.add('connected');
@@ -661,8 +1049,36 @@ setInterval(() => {
                 } else {
                     document.getElementById('bmv-ttg').textContent = '---';
                 }
+                // Alarm
+                var alarmEl = document.getElementById('bmv-alarm');
+                if (data.battery.alarm_active && data.battery.alarm_reason) {
+                    alarmEl.textContent = 'ALARM: ' + data.battery.alarm_reason;
+                } else {
+                    alarmEl.textContent = '';
+                }
+                // Energy totals
                 document.getElementById('bmv-charged').textContent = data.battery.charged_kwh.toFixed(2) + ' kWh';
                 document.getElementById('bmv-discharged').textContent = data.battery.discharged_kwh.toFixed(2) + ' kWh';
+                document.getElementById('bmv-consumed').textContent = data.battery.consumed_ah.toFixed(2) + ' Ah';
+                document.getElementById('bmv-cycles').textContent = data.battery.charge_cycles || '---';
+                // History
+                document.getElementById('bmv-min-v').textContent = data.battery.min_voltage_v ? data.battery.min_voltage_v.toFixed(2) + ' V' : '---';
+                document.getElementById('bmv-max-v').textContent = data.battery.max_voltage_v ? data.battery.max_voltage_v.toFixed(2) + ' V' : '---';
+                if (data.battery.seconds_since_full_charge > 0) {
+                    var sh = Math.floor(data.battery.seconds_since_full_charge / 3600);
+                    var sm = Math.floor((data.battery.seconds_since_full_charge % 3600) / 60);
+                    document.getElementById('bmv-since-full').textContent = sh + 'h ' + sm + 'm';
+                } else {
+                    document.getElementById('bmv-since-full').textContent = '---';
+                }
+                if (data.battery.has_temperature) {
+                    document.getElementById('bmv-temp').textContent = data.battery.temperature_c.toFixed(1) + 'C';
+                } else {
+                    document.getElementById('bmv-temp').textContent = '---';
+                }
+                // Device info
+                document.getElementById('bmv-fw').textContent = data.battery.firmware_version || '---';
+                document.getElementById('bmv-serial').textContent = data.battery.serial_number || '---';
             } else {
                 document.querySelector('.battery-card').classList.remove('connected');
             }
@@ -672,11 +1088,30 @@ setInterval(() => {
             if (data.mode) {
                 document.getElementById('mode-name').textContent = data.mode.current;
                 document.getElementById('mode-desc').textContent = data.mode.description;
+                // Sync override state from server (but don't change slider if user is dragging)
+                if (data.mode.override !== overrideActive) {
+                    overrideActive = data.mode.override;
+                    if (!overrideActive) {
+                        // Override was cleared, reset slider to 0
+                        document.getElementById('override-slider').value = 0;
+                        document.getElementById('override-value').textContent = '0 W';
+                    }
+                }
+                // If override is active, sync the value from server
+                if (overrideActive && data.mode.override_value_w !== undefined) {
+                    var serverValue = Math.round(data.mode.override_value_w);
+                    var slider = document.getElementById('override-slider');
+                    // Only update if different (to avoid interrupting user interaction)
+                    if (parseInt(slider.value) !== serverValue) {
+                        slider.value = serverValue;
+                        document.getElementById('override-value').textContent = serverValue + ' W';
+                    }
+                }
             }
         })
         .catch(() => {});
 }, 2000);
-`
+`, overrideActiveJS)
 }
 
 func (h *Handler) configHTML() string {
@@ -868,6 +1303,82 @@ textarea { width: 100%%; min-height: 200px; padding: 1rem; background: #0f172a; 
             </div>
         </div>
 
+        <div class="card">
+            <h2>MQTT Publisher</h2>
+            <div class="form-group checkbox-group">
+                <input type="checkbox" id="mqtt-enabled" %s>
+                <label for="mqtt-enabled">Enable MQTT Publishing</label>
+            </div>
+            <div class="form-group">
+                <label>Broker Address</label>
+                <input type="text" id="mqtt-broker" value="%s" placeholder="tcp://localhost:1883">
+            </div>
+            <div class="form-group">
+                <label>Topic</label>
+                <input type="text" id="mqtt-topic" value="%s" placeholder="energy/status">
+            </div>
+            <div class="form-group">
+                <label>Client ID</label>
+                <input type="text" id="mqtt-client-id" value="%s" placeholder="energymanager">
+            </div>
+            <div class="form-group">
+                <label>Username (optional)</label>
+                <input type="text" id="mqtt-username" value="%s">
+            </div>
+            <div class="form-group">
+                <label>Password (optional)</label>
+                <input type="password" id="mqtt-password" value="%s">
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>InfluxDB Time Series</h2>
+            <p style="color: #64748b; font-size: 0.875rem; margin-bottom: 1rem;">
+                Export metrics to InfluxDB for long-term storage and Grafana dashboards
+            </p>
+            <div class="form-group checkbox-group">
+                <input type="checkbox" id="influx-enabled" %s>
+                <label for="influx-enabled">Enable InfluxDB Export</label>
+            </div>
+            <div class="form-group">
+                <label>Server URL</label>
+                <input type="text" id="influx-url" value="%s" placeholder="http://localhost:8086">
+            </div>
+            <div class="form-group">
+                <label>Database/Bucket Name</label>
+                <input type="text" id="influx-database" value="%s" placeholder="energy">
+            </div>
+            <div class="form-group">
+                <label>Batch Interval</label>
+                <select id="influx-interval">
+                    <option value="1m" %s>1 minute</option>
+                    <option value="5m" %s>5 minutes</option>
+                    <option value="10m" %s>10 minutes</option>
+                    <option value="15m" %s>15 minutes</option>
+                </select>
+            </div>
+            <hr style="border-color: #334155; margin: 1rem 0;">
+            <p style="color: #64748b; font-size: 0.75rem; margin-bottom: 0.5rem;">InfluxDB 1.x Authentication</p>
+            <div class="form-group">
+                <label>Username (optional)</label>
+                <input type="text" id="influx-username" value="%s">
+            </div>
+            <div class="form-group">
+                <label>Password (optional)</label>
+                <input type="password" id="influx-password" value="%s">
+            </div>
+            <hr style="border-color: #334155; margin: 1rem 0;">
+            <p style="color: #64748b; font-size: 0.75rem; margin-bottom: 0.5rem;">InfluxDB 2.x Authentication</p>
+            <div class="form-group">
+                <label>Organization</label>
+                <input type="text" id="influx-org" value="%s" placeholder="my-org">
+            </div>
+            <div class="form-group">
+                <label>API Token</label>
+                <input type="password" id="influx-token" value="%s">
+            </div>
+        </div>
+
         <div class="card" style="grid-column: 1 / -1;">
             <h2>Time-of-Use Schedule</h2>
             <p style="color: #64748b; font-size: 0.875rem; margin-bottom: 1rem;">
@@ -1010,6 +1521,14 @@ function useDevice(addr) {
     document.getElementById('shelly-addr').value = addr;
 }
 
+// Parse interval string to nanoseconds for Go time.Duration
+function parseInfluxInterval(str) {
+    const val = parseInt(str);
+    if (str.endsWith('m')) return val * 60 * 1000000000;
+    if (str.endsWith('h')) return val * 60 * 60 * 1000000000;
+    return 5 * 60 * 1000000000; // default 5 minutes
+}
+
 function saveConfig() {
     const config = {
         shelly_addr: document.getElementById('shelly-addr').value,
@@ -1036,7 +1555,21 @@ function saveConfig() {
             min_soc_pct: parseFloat(document.getElementById('batsave-min-soc').value),
             target_soc_at_sunrise: parseFloat(document.getElementById('batsave-target-soc').value),
             sunrise_offset_min: parseInt(document.getElementById('batsave-offset').value),
-        }
+        },
+        mqtt_enabled: document.getElementById('mqtt-enabled').checked,
+        mqtt_broker: document.getElementById('mqtt-broker').value,
+        mqtt_topic: document.getElementById('mqtt-topic').value,
+        mqtt_client_id: document.getElementById('mqtt-client-id').value,
+        mqtt_username: document.getElementById('mqtt-username').value,
+        mqtt_password: document.getElementById('mqtt-password').value,
+        influx_enabled: document.getElementById('influx-enabled').checked,
+        influx_url: document.getElementById('influx-url').value,
+        influx_database: document.getElementById('influx-database').value,
+        influx_interval: parseInfluxInterval(document.getElementById('influx-interval').value),
+        influx_username: document.getElementById('influx-username').value,
+        influx_password: document.getElementById('influx-password').value,
+        influx_org: document.getElementById('influx-org').value,
+        influx_token: document.getElementById('influx-token').value
     };
 
     fetch('/api/config', {
@@ -1232,6 +1765,23 @@ refreshPorts(); // Load ports on page load
 		h.config.BatterySaveConfig.MinSOC,
 		h.config.BatterySaveConfig.TargetSOC,
 		h.config.BatterySaveConfig.SunriseOffset,
+		checkedAttr(h.config.MQTTEnabled),
+		h.config.MQTTBroker,
+		h.config.MQTTTopic,
+		h.config.MQTTClientID,
+		h.config.MQTTUsername,
+		h.config.MQTTPassword,
+		checkedAttr(h.config.InfluxEnabled),
+		h.config.InfluxURL,
+		h.config.InfluxDatabase,
+		h.influxIntervalSelected(1*time.Minute),
+		h.influxIntervalSelected(5*time.Minute),
+		h.influxIntervalSelected(10*time.Minute),
+		h.influxIntervalSelected(15*time.Minute),
+		h.config.InfluxUsername,
+		h.config.InfluxPassword,
+		h.config.InfluxOrg,
+		h.config.InfluxToken,
 		checkedAttr(h.config.ModeSchedule.Enabled),
 		string(cfg),
 		h.touPeriodsJSON(),
@@ -1242,6 +1792,13 @@ refreshPorts(); // Load ports on page load
 func checkedAttr(b bool) string {
 	if b {
 		return "checked"
+	}
+	return ""
+}
+
+func (h *Handler) influxIntervalSelected(interval time.Duration) string {
+	if h.config.InfluxInterval == interval {
+		return "selected"
 	}
 	return ""
 }
