@@ -1,0 +1,90 @@
+# Energy Manager configuration for OpenWRT
+# All settings are configurable via web UI at http://<router-ip>:8081/config
+
+config main 'main'
+    option enabled '1'
+    option listen ':8081'
+    # Auto-discover Shelly Pro EM3 on network
+    option shelly_autoconfig '1'
+    # Or manually specify: option shelly_addr '192.168.254.100:502'
+    option shelly_addr ''
+    option shelly_interval '1s'
+
+config victron 'victron'
+    option enabled '1'
+    # VE.Bus port for MultiPlus/Quattro (via MK2/MK3 USB)
+    option port '/dev/ttyUSB0'
+    # Maximum charge/discharge power in watts
+    option maxpower '5000'
+
+config bmv 'bmv'
+    option enabled '1'
+    # VE.Direct port for BMV-700/712/SmartShunt battery monitor
+    # Uses 19200 baud, reads battery voltage, current, SOC, kWh, etc.
+    option port '/dev/ttyUSB1'
+
+config battery 'battery'
+    # Battery capacity in kWh (for remaining energy calculations)
+    option capacity '10.0'
+
+config location 'location'
+    # For sunrise/sunset calculations (Battery Save mode)
+    option latitude '40.7128'
+    option longitude '-74.0060'
+
+config pid 'pid'
+    option enabled '1'
+    # PID gains - tune these for your system
+    option kp '0.8'
+    option ki '0.05'
+    option kd '0.1'
+    # Target grid power (0 = zero export/import)
+    option setpoint '0'
+
+config mode 'mode'
+    # Default operating mode on startup
+    # Options: manual, pid, tou, solar, battery_save
+    option default 'pid'
+
+config tou 'tou'
+    # Time-of-Use schedule (configure via web UI)
+    # Example periods (JSON array):
+    # option schedule '[{"name":"offpeak","start_hour":0,"end_hour":7,"days":[0,1,2,3,4,5,6],"rate":0.10,"action":"charge"},{"name":"peak","start_hour":17,"end_hour":21,"days":[1,2,3,4,5],"rate":0.35,"action":"discharge"}]'
+
+config solar 'solar'
+    # Solar mode settings
+    # zero_export: 1 = never export to grid (default), 0 = allow export
+    option zero_export '1'
+    option export_limit '0'
+    option min_soc '20'
+    option max_soc '100'
+    option prefer_self_use '1'
+
+config battery_save 'battery_save'
+    # Battery Save mode settings
+    # Gradually discharge overnight to reach target SOC at sunrise
+    option min_soc '20'
+    option target_soc_sunrise '30'
+    option sunrise_offset_minutes '30'
+
+config schedule 'schedule'
+    # Mode schedule for automatic mode switching
+    # Enable with: option enabled '1'
+    # Configure via web UI - schedule stored as JSON
+    option enabled '0'
+    # Example schedule (JSON array of periods):
+    # option periods '[{"name":"Night","start_time":{"type":"absolute","hour":0},"end_time":{"type":"sunrise","offset":0},"mode":"battery_save","priority":1},{"name":"Day","start_time":{"type":"sunrise","offset":0},"end_time":{"type":"absolute","hour":15},"mode":"solar","priority":1},{"name":"Evening","start_time":{"type":"absolute","hour":15},"end_time":{"type":"absolute","hour":24},"mode":"tou","priority":1}]'
+
+config mqtt 'mqtt'
+    option enabled '0'
+    option broker 'tcp://localhost:1883'
+    option topic 'energy/status'
+    option clientid 'energymanager'
+    option username ''
+    option password ''
+
+config auth 'auth'
+    # Credentials for accessing /config and mode control
+    # Default: admin / energy
+    option username 'admin'
+    option password 'energy'

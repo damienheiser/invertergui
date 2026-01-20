@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Energy Manager - GL.iNet Opal</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+    color: #e2e8f0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 2rem;
+}
+.header {
+    text-align: center;
+    margin-bottom: 2rem;
+}
+.header h1 {
+    font-size: 2.5rem;
+    font-weight: 700;
+    color: #38bdf8;
+    margin-bottom: 0.5rem;
+}
+.header p {
+    color: #94a3b8;
+    font-size: 1.1rem;
+}
+.container {
+    max-width: 800px;
+    width: 100%;
+}
+.status-card {
+    background: #1e293b;
+    border-radius: 1rem;
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+    border: 1px solid #334155;
+}
+.status-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1rem;
+}
+.status-header h2 {
+    color: #f8fafc;
+    font-size: 1.25rem;
+}
+.status-indicator {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+.status-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    animation: pulse 2s infinite;
+}
+.status-dot.online { background: #4ade80; }
+.status-dot.offline { background: #f87171; animation: none; }
+.status-dot.warning { background: #facc15; }
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+.power-display {
+    text-align: center;
+    padding: 1rem;
+}
+.power-value {
+    font-size: 3.5rem;
+    font-weight: 700;
+    line-height: 1;
+}
+.power-value.importing { color: #f87171; }
+.power-value.exporting { color: #4ade80; }
+.power-value.balanced { color: #facc15; }
+.power-label {
+    color: #64748b;
+    font-size: 0.875rem;
+    margin-top: 0.5rem;
+}
+.links-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 1rem;
+    margin-top: 1rem;
+}
+.link-card {
+    background: #0f172a;
+    border: 1px solid #334155;
+    border-radius: 0.75rem;
+    padding: 1.25rem;
+    text-decoration: none;
+    color: #f8fafc;
+    transition: all 0.2s;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+}
+.link-card:hover {
+    border-color: #38bdf8;
+    transform: translateY(-2px);
+}
+.link-card .icon {
+    font-size: 2rem;
+    margin-bottom: 0.5rem;
+}
+.link-card h3 {
+    font-size: 1rem;
+    margin-bottom: 0.25rem;
+}
+.link-card p {
+    font-size: 0.75rem;
+    color: #64748b;
+}
+.link-card.primary {
+    background: #1e40af;
+    border-color: #3b82f6;
+}
+.link-card.primary:hover {
+    background: #1d4ed8;
+}
+.footer {
+    margin-top: 2rem;
+    text-align: center;
+    color: #64748b;
+    font-size: 0.875rem;
+}
+.footer a {
+    color: #38bdf8;
+    text-decoration: none;
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+    <h1>Energy Manager</h1>
+    <p>GL.iNet Opal | Shelly Pro EM3 + Victron MultiPlus</p>
+</div>
+
+<div class="container">
+    <div class="status-card">
+        <div class="status-header">
+            <h2>Current Grid Power</h2>
+            <div class="status-indicator">
+                <div class="status-dot" id="status-dot"></div>
+                <span id="status-text">Loading...</span>
+            </div>
+        </div>
+        <div class="power-display">
+            <div class="power-value" id="grid-power">---</div>
+            <div class="power-label">Watts (positive = importing, negative = exporting)</div>
+        </div>
+    </div>
+
+    <div class="links-grid">
+        <a id="link-dashboard" href="#" class="link-card primary">
+            <div class="icon">📊</div>
+            <h3>Energy Dashboard</h3>
+            <p>Full monitoring & control</p>
+        </a>
+        <a id="link-config" href="#" class="link-card">
+            <div class="icon">⚙️</div>
+            <h3>Configuration</h3>
+            <p>Settings & modes</p>
+        </a>
+        <a href="/gl_home.html" class="link-card">
+            <div class="icon">🌐</div>
+            <h3>GL.iNet Admin</h3>
+            <p>Router settings</p>
+        </a>
+        <a href="/cgi-bin/luci/" class="link-card">
+            <div class="icon">🔧</div>
+            <h3>LuCI Admin</h3>
+            <p>Advanced OpenWRT</p>
+        </a>
+        <a href="/cgi-bin/luci/admin/vpn/zerotier/status" class="link-card">
+            <div class="icon">🔗</div>
+            <h3>ZeroTier</h3>
+            <p>Remote access VPN</p>
+        </a>
+        <a id="link-metrics" href="#" class="link-card">
+            <div class="icon">📈</div>
+            <h3>Prometheus</h3>
+            <p>Metrics endpoint</p>
+        </a>
+    </div>
+</div>
+
+<div class="footer">
+    <p>Energy Manager v1.0 | <a id="link-api" href="#">JSON API</a></p>
+</div>
+
+<script>
+// Detect base URL for energy manager (port 8081)
+var baseUrl = window.location.protocol + '//' + window.location.hostname + ':8081';
+
+// Set dynamic links
+document.getElementById('link-dashboard').href = baseUrl + '/';
+document.getElementById('link-config').href = baseUrl + '/config';
+document.getElementById('link-metrics').href = baseUrl + '/metrics';
+document.getElementById('link-api').href = baseUrl + '/api/status';
+
+function updateStatus() {
+    fetch(baseUrl + '/api/status')
+        .then(r => r.json())
+        .then(data => {
+            const dot = document.getElementById('status-dot');
+            const text = document.getElementById('status-text');
+            const power = document.getElementById('grid-power');
+
+            if (data.grid && data.grid.valid) {
+                const gridW = Math.round(data.grid.total_power_w);
+                power.textContent = gridW + ' W';
+
+                if (gridW > 50) {
+                    power.className = 'power-value importing';
+                    dot.className = 'status-dot warning';
+                    text.textContent = 'Importing';
+                } else if (gridW < -50) {
+                    power.className = 'power-value exporting';
+                    dot.className = 'status-dot online';
+                    text.textContent = 'Exporting';
+                } else {
+                    power.className = 'power-value balanced';
+                    dot.className = 'status-dot online';
+                    text.textContent = 'Balanced';
+                }
+            } else {
+                power.textContent = '---';
+                dot.className = 'status-dot offline';
+                text.textContent = 'No data';
+            }
+        })
+        .catch(() => {
+            document.getElementById('status-dot').className = 'status-dot offline';
+            document.getElementById('status-text').textContent = 'Offline';
+            document.getElementById('grid-power').textContent = '---';
+        });
+}
+
+updateStatus();
+setInterval(updateStatus, 2000);
+</script>
+</body>
+</html>
