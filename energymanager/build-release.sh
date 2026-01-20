@@ -75,6 +75,7 @@ mkdir -p ${RELEASE_DIR}
 
 # Copy common files
 cp openwrt/files/energymanager.init ${RELEASE_DIR}/
+cp openwrt/files/energymanager-watchdog ${RELEASE_DIR}/
 cp openwrt/files/etc/config/energymanager ${RELEASE_DIR}/energymanager.config
 cp README.md ${RELEASE_DIR}/
 
@@ -93,6 +94,7 @@ for target in "${TARGETS[@]}"; do
 
     # Copy common files
     cp ${RELEASE_DIR}/energymanager.init ${PACKAGE_DIR}/
+    cp ${RELEASE_DIR}/energymanager-watchdog ${PACKAGE_DIR}/
     cp ${RELEASE_DIR}/energymanager.config ${PACKAGE_DIR}/
 
     # Create quick install script
@@ -112,8 +114,19 @@ chmod +x /usr/bin/energymanager
 cp energymanager.init /etc/init.d/energymanager
 chmod +x /etc/init.d/energymanager
 
+cp energymanager-watchdog /usr/bin/
+chmod +x /usr/bin/energymanager-watchdog
+
 # Only copy config if not exists (preserve existing config)
 [ ! -f /etc/config/energymanager ] && cp energymanager.config /etc/config/energymanager
+
+# Setup watchdog cron job (every minute)
+CRON_JOB="* * * * * /usr/bin/energymanager-watchdog"
+if ! grep -q "energymanager-watchdog" /etc/crontabs/root 2>/dev/null; then
+    echo "$CRON_JOB" >> /etc/crontabs/root
+    /etc/init.d/cron restart 2>/dev/null || true
+    echo "Watchdog cron job installed"
+fi
 
 # Enable and start service
 /etc/init.d/energymanager enable
@@ -122,7 +135,7 @@ chmod +x /etc/init.d/energymanager
 echo ""
 echo "Installation complete!"
 echo "Access dashboard at: http://$(uci get network.lan.ipaddr 2>/dev/null || echo 'router-ip'):8081/"
-echo "Config login: admin / energy"
+echo "Config login: root / <your router password>"
 EOF
     chmod +x ${PACKAGE_DIR}/install.sh
 
@@ -136,7 +149,7 @@ EOF
 done
 
 # Clean up temp files
-rm -f ${RELEASE_DIR}/energymanager.init ${RELEASE_DIR}/energymanager.config ${RELEASE_DIR}/README.md
+rm -f ${RELEASE_DIR}/energymanager.init ${RELEASE_DIR}/energymanager-watchdog ${RELEASE_DIR}/energymanager.config ${RELEASE_DIR}/README.md
 
 # Create checksums
 echo ""

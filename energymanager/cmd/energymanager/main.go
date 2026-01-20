@@ -27,8 +27,8 @@ import (
 )
 
 var (
-	// Server
-	listenAddr = flag.String("listen", ":8080", "HTTP listen address")
+	// Server - port 8081 to avoid conflict with GL.iNet admin panel on 8080
+	listenAddr = flag.String("listen", ":8081", "HTTP listen address")
 
 	// Shelly Pro EM3
 	shellyAddr       = flag.String("shelly.addr", "", "Shelly Pro EM3 address (host:port), auto-discover if empty")

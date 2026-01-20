@@ -24,7 +24,8 @@ start_service() {
     config_get_bool enabled main enabled 1
     [ "$enabled" -eq 0 ] && return 0
 
-    config_get listen main listen ":8080"
+    # Port 8081 - avoid conflict with GL.iNet admin panel on 8080
+    config_get listen main listen ":8081"
     config_get shelly_addr main shelly_addr ""
     config_get shelly_interval main shelly_interval "1s"
     config_get_bool shelly_autoconfig main shelly_autoconfig 1
