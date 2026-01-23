@@ -40,7 +40,7 @@ var (
 	// Victron MK2/MK3 (VE.Bus inverter control)
 	victronPort     = flag.String("victron.port", "/dev/ttyUSB0", "Victron VE.Bus serial port (MK2/MK3)")
 	victronEnabled  = flag.Bool("victron.enabled", true, "Enable Victron inverter control")
-	victronMaxPower = flag.Float64("victron.maxpower", 5000, "Max inverter power (W)")
+	victronMaxPower = flag.Float64("victron.maxpower", 4500, "Max inverter power (W)")
 
 	// Victron BMV/SmartShunt (VE.Direct battery monitor)
 	bmvPort    = flag.String("bmv.port", "/dev/ttyUSB1", "Victron BMV VE.Direct serial port")
