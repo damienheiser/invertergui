@@ -169,20 +169,18 @@ func (h *Handler) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 
 // RegisterRoutes registers all HTTP routes
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	// Public endpoints - no auth required
+	// All endpoints are public - authentication removed per user request
 	mux.HandleFunc("/", h.serveDashboard)
 	mux.HandleFunc("/api/status", h.serveStatus)
 	mux.HandleFunc("/api/init", h.handleInitStatus)
-
-	// Protected endpoints - require authentication
-	mux.HandleFunc("/config", h.requireAuth(h.serveConfig))
-	mux.HandleFunc("/api/config", h.requireAuth(h.handleConfig))
-	mux.HandleFunc("/api/mode", h.requireAuth(h.handleMode))
-	mux.HandleFunc("/api/override", h.requireAuth(h.handleOverride))
-	mux.HandleFunc("/api/discover", h.requireAuth(h.handleDiscover))
-	mux.HandleFunc("/api/tou", h.requireAuth(h.handleTOU))
-	mux.HandleFunc("/api/schedule", h.requireAuth(h.handleSchedule))
-	mux.HandleFunc("/api/ports", h.requireAuth(h.handlePorts))
+	mux.HandleFunc("/config", h.serveConfig)
+	mux.HandleFunc("/api/config", h.handleConfig)
+	mux.HandleFunc("/api/mode", h.handleMode)
+	mux.HandleFunc("/api/override", h.handleOverride)
+	mux.HandleFunc("/api/discover", h.handleDiscover)
+	mux.HandleFunc("/api/tou", h.handleTOU)
+	mux.HandleFunc("/api/schedule", h.handleSchedule)
+	mux.HandleFunc("/api/ports", h.handlePorts)
 }
 
 func (h *Handler) handleInitStatus(w http.ResponseWriter, r *http.Request) {

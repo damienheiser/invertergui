@@ -88,7 +88,7 @@ func New(port io.ReadWriteCloser, maxPower float64) *VEBus {
 	return &VEBus{
 		port:     port,
 		rxBuf:    make([]byte, 0, 256),
-		timeout:  500 * time.Millisecond,
+		timeout:  2 * time.Second, // Increased for MK3 response time
 		maxPower: maxPower,
 	}
 }
@@ -98,6 +98,11 @@ func (v *VEBus) Connect() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
+	// Give the MK3 time to initialize after port open
+	log.Println("vebus: waiting 200ms for MK3 to initialize...")
+	time.Sleep(200 * time.Millisecond)
+
+	log.Println("vebus: requesting MK2 version...")
 	// Get version
 	version, err := v.getVersion()
 	if err != nil {
@@ -404,22 +409,17 @@ func (v *VEBus) setPowerInternal(power int16) error {
 		return err
 	}
 
-	// Accept either response format
-	rx, err := v.receiveFrame([]byte{0xFF, 0x58}, v.timeout)
+	// Response is 0x03 0xFF 0x58 0x87 [checksum] (length=3 bytes after header)
+	// Use header with length byte to ensure proper frame parsing
+	rx, err := v.receiveFrame([]byte{0x03, 0xFF, 0x58}, v.timeout)
 	if err != nil {
 		return err
 	}
 	if len(rx) < 4 {
-		return fmt.Errorf("short response")
+		return fmt.Errorf("short response: %x", rx)
 	}
 
-	// Find 0x87 response code
-	for i := 0; i < len(rx)-1; i++ {
-		if rx[i] == 0x58 && rx[i+1] == 0x87 {
-			return nil
-		}
-	}
-	// Also check standard position
+	// Check for 0x87 success response code at position 3
 	if rx[3] == 0x87 {
 		return nil
 	}
@@ -429,6 +429,7 @@ func (v *VEBus) setPowerInternal(power int16) error {
 
 func (v *VEBus) sendFrame(cmd byte, data []byte) error {
 	frame := v.buildFrame(cmd, data)
+	log.Printf("vebus: TX cmd=%c data=%x frame=%x", cmd, data, frame)
 	_, err := v.port.Write(frame)
 	return err
 }
@@ -466,27 +467,64 @@ func (v *VEBus) receiveFrame(header []byte, timeout time.Duration) ([]byte, erro
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
+		if n > 0 {
+			log.Printf("vebus: RX +%d bytes: %x", n, buf[:n])
+		}
 		v.rxBuf = append(v.rxBuf, buf[:n]...)
 
-		// Look for header
-		idx := bytes.Index(v.rxBuf, header)
-		if idx < 0 {
-			continue
-		}
+		// Try to find and extract valid frames from buffer
+		for len(v.rxBuf) >= 2 {
+			// Look for any valid frame start (length byte followed by 0xFF or 0x20 marker)
+			frameStart := -1
+			for i := 0; i < len(v.rxBuf)-1; i++ {
+				if v.rxBuf[i] >= 2 && v.rxBuf[i] <= 32 { // Reasonable length 2-32
+					if v.rxBuf[i+1] == 0xFF || v.rxBuf[i+1] == 0x20 {
+						frameStart = i
+						break
+					}
+				}
+			}
 
-		// Check if we have complete frame
-		if idx < len(v.rxBuf) {
-			frameLen := int(v.rxBuf[idx]) + 2
-			if len(v.rxBuf)-idx >= frameLen {
-				frame := make([]byte, frameLen)
-				copy(frame, v.rxBuf[idx:idx+frameLen])
+			if frameStart < 0 {
+				// No valid frame start found, keep only last byte (might be start of next frame)
+				if len(v.rxBuf) > 1 {
+					v.rxBuf = v.rxBuf[len(v.rxBuf)-1:]
+				}
+				break
+			}
+
+			// Discard garbage before frame start
+			if frameStart > 0 {
+				log.Printf("vebus: discarding %d bytes of garbage: %x", frameStart, v.rxBuf[:frameStart])
+				v.rxBuf = v.rxBuf[frameStart:]
+			}
+
+			// Check if we have complete frame
+			frameLen := int(v.rxBuf[0]) + 2 // length byte + data + checksum
+			if len(v.rxBuf) < frameLen {
+				break // Need more data
+			}
+
+			// Extract frame
+			frame := make([]byte, frameLen)
+			copy(frame, v.rxBuf[:frameLen])
+			v.rxBuf = v.rxBuf[frameLen:]
+
+			// Check if this frame matches our expected header
+			if len(header) <= len(frame) && bytes.Equal(frame[:len(header)], header) {
+				log.Printf("vebus: RX complete frame: %x", frame)
 				return frame, nil
 			}
+
+			// Frame doesn't match our header - it's an unsolicited frame, skip it
+			log.Printf("vebus: skipping unsolicited frame: %x (waiting for %x)", frame, header)
 		}
 	}
 
 	if len(v.rxBuf) > 0 {
-		return nil, fmt.Errorf("invalid frame: %x", v.rxBuf)
+		log.Printf("vebus: RX timeout with partial data: %x (waiting for header %x)", v.rxBuf, header)
+		return nil, fmt.Errorf("receive timeout with partial data")
 	}
+	log.Printf("vebus: RX timeout (no data received)")
 	return nil, fmt.Errorf("receive timeout")
 }

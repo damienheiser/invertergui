@@ -712,43 +712,49 @@ func controlLoop(hub *core.Hub, em3 *shelly.EM3, vbus *vebus.VEBus, bmv *vedirec
 			}
 		}
 
-		// Calculate setpoint based on current mode
+		// Calculate setpoint based on current mode (always calculate, even without grid data)
+		gridPower := info.Grid.TotalPower
 		var setpoint float64
-		if info.Grid.Valid {
-			setpoint, info.Mode = modeCtrl.Calculate(info.Grid.TotalPower)
-		}
+		setpoint, info.Mode = modeCtrl.Calculate(gridPower)
 
-		// Run PID controller if in PID mode or need zero-grid control
+		// Run PID controller
 		var output float64
-		if pidCtrl != nil && info.Grid.Valid {
+		if pidCtrl != nil {
 			// For non-PID modes, use the mode's calculated setpoint
 			if modeCtrl.GetMode() != core.ModePID && modeCtrl.GetMode() != core.ModeManual {
 				pidCtrl.SetSetpoint(setpoint)
 			}
 
-			output = pidCtrl.Update(info.Grid.TotalPower)
-			pidSetpoint, lastErr, _, _, enabled := pidCtrl.State()
+			// Update PID controller - uses 0 grid power if Shelly disconnected
+			output = pidCtrl.Update(gridPower)
+			pidSetpoint, lastErr, _, _, _ := pidCtrl.State()
 
 			info.PID = core.PIDData{
 				Setpoint:  pidSetpoint,
-				GridPower: info.Grid.TotalPower,
+				GridPower: gridPower,
 				Error:     lastErr,
 				Output:    output,
-				Enabled:   enabled,
+				Enabled:   info.Grid.Valid, // Only mark as enabled when grid data is valid
 			}
 		}
 
-		// Send command to inverter
+		// Send command to inverter (only when grid data valid or override is active)
 		if vbus != nil && info.Inverter.Valid {
 			// Use mode output if override, otherwise PID output
 			cmdOutput := output
 			if info.Mode.Override {
+				// Override always works, even without grid data
 				cmdOutput = info.Mode.OverrideVal
+				if err := vbus.SetPower(cmdOutput); err != nil {
+					log.Printf("Failed to set inverter power: %v", err)
+				}
+			} else if info.Grid.Valid {
+				// Normal PID control only when grid data is valid
+				if err := vbus.SetPower(cmdOutput); err != nil {
+					log.Printf("Failed to set inverter power: %v", err)
+				}
 			}
-
-			if err := vbus.SetPower(cmdOutput); err != nil {
-				log.Printf("Failed to set inverter power: %v", err)
-			}
+			// When grid is invalid and no override, don't send commands (hold last state)
 		}
 
 		// Broadcast to subscribers
