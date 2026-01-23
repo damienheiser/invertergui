@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && !mips && !mipsle && !mips64 && !mips64le
 
 package serial
 
@@ -161,12 +161,17 @@ func openPort(c *Config) (Port, error) {
 		t.Cflag |= cstopb
 	}
 
-	// Set baud rate
+	// Set baud rate - must be in both cflag (CBAUD) and speed fields
 	speed, ok := baudRates[c.Baud]
 	if !ok {
 		file.Close()
 		return nil, fmt.Errorf("unsupported baud rate: %d", c.Baud)
 	}
+	// Clear existing baud rate bits (CBAUD mask = 0x100F)
+	t.Cflag &^= 0x100F
+	// Set baud rate in cflag - this is what FTDI driver uses
+	t.Cflag |= speed
+	// Also set in speed fields for compatibility
 	t.Ispeed = speed
 	t.Ospeed = speed
 
