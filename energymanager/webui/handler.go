@@ -47,6 +47,7 @@ type Handler struct {
 	mu         sync.RWMutex
 	latest     *core.EnergyInfo
 	initStatus *InitStatus
+	wsHub      *WSHub
 }
 
 // Config holds runtime configuration
@@ -112,9 +113,18 @@ func New(hub *core.Hub, modeCtrl *modes.Controller, cfg *Config) *Handler {
 			Description: "Starting Energy Manager...",
 			Ready:       false,
 		},
+		wsHub: NewWSHub(hub),
 	}
+	h.wsHub.Start()
 	go h.updateLoop()
 	return h
+}
+
+// Stop shuts down the handler and WebSocket hub
+func (h *Handler) Stop() {
+	if h.wsHub != nil {
+		h.wsHub.Stop()
+	}
 }
 
 // SetCallbacks sets the service reconfiguration callbacks
@@ -182,6 +192,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/tou", h.handleTOU)
 	mux.HandleFunc("/api/schedule", h.handleSchedule)
 	mux.HandleFunc("/api/ports", h.handlePorts)
+	mux.HandleFunc("/ws", h.wsHub.ServeWS) // WebSocket endpoint for real-time updates
 }
 
 func (h *Handler) handleInitStatus(w http.ResponseWriter, r *http.Request) {
@@ -1088,150 +1099,234 @@ function setSimulatedLoad(enabled) {
     }).then(() => location.reload());
 }
 
-// Auto-refresh
-setInterval(() => {
-    fetch('/api/status')
-        .then(r => r.json())
-        .then(data => {
-            if (data.grid) {
-                var gridBadge = document.querySelector('.grid-card .status-badge');
-                var gridError = document.getElementById('grid-error');
-                if (data.grid.valid) {
-                    document.getElementById('grid-power').textContent = Math.round(data.grid.total_power_w) + ' W';
-                    gridBadge.className = 'status-badge online';
-                    gridBadge.textContent = 'Online';
-                    gridError.textContent = '';
-                } else {
-                    document.getElementById('grid-power').textContent = '---';
-                    gridBadge.className = 'status-badge ' + (data.grid.error ? 'error' : 'offline');
-                    gridBadge.textContent = data.grid.error ? 'Error' : 'Offline';
-                    gridError.textContent = data.grid.error || '';
+// WebSocket connection for real-time updates
+var ws = null;
+var wsReconnectTimeout = null;
+var wsConnected = false;
+
+function updateDashboard(data) {
+    if (data.grid) {
+        var gridBadge = document.querySelector('.grid-card .status-badge');
+        var gridError = document.getElementById('grid-error');
+        var gridPower = document.getElementById('grid-power');
+        if (data.grid.valid) {
+            gridPower.textContent = Math.round(data.grid.total_power_w) + ' W';
+            // Update color based on power direction
+            gridPower.className = 'big ' + (data.grid.total_power_w > 50 ? 'importing' : data.grid.total_power_w < -50 ? 'exporting' : 'balanced');
+            gridBadge.className = 'status-badge online';
+            gridBadge.textContent = 'Online';
+            gridError.textContent = '';
+            // Update phases
+            if (data.grid.phases && data.grid.phases.length >= 3) {
+                var phaseDivs = document.querySelectorAll('.phase');
+                for (var i = 0; i < 3 && i < phaseDivs.length; i++) {
+                    var p = data.grid.phases[i];
+                    var main = phaseDivs[i].querySelector('.phase-main');
+                    var detail = phaseDivs[i].querySelector('.phase-detail');
+                    if (main) main.textContent = p.voltage_v.toFixed(1) + ' V | ' + p.current_a.toFixed(2) + ' A | ' + Math.round(p.active_power_w) + ' W';
+                    if (detail) detail.textContent = Math.round(p.apparent_power_va) + ' VA | PF: ' + p.power_factor.toFixed(2) + ' | ' + p.frequency_hz.toFixed(1) + ' Hz';
                 }
             }
-            if (data.inverter && data.inverter.valid) {
-                document.getElementById('inv-state').textContent = data.inverter.state;
-                document.getElementById('inv-power').textContent = Math.round(data.inverter.bat_power_w) + ' W';
-                document.getElementById('bat-voltage').textContent = data.inverter.bat_voltage_v.toFixed(1) + ' V';
-                document.getElementById('bat-soc').textContent = Math.round(data.inverter.bat_soc_pct) + '%';
-                document.getElementById('soc-fill').style.width = data.inverter.bat_soc_pct + '%';
-                if (data.inverter.ac_in_voltage_v > 0) {
-                    document.getElementById('inv-ac-in-v').textContent = data.inverter.ac_in_voltage_v.toFixed(1) + ' V';
-                    document.getElementById('inv-ac-in-a').textContent = data.inverter.ac_in_current_a.toFixed(1) + ' A';
+        } else {
+            gridPower.textContent = '---';
+            gridPower.className = 'big';
+            gridBadge.className = 'status-badge ' + (data.grid.error ? 'error' : 'offline');
+            gridBadge.textContent = data.grid.error ? 'Error' : 'Offline';
+            gridError.textContent = data.grid.error || '';
+        }
+    }
+    if (data.inverter && data.inverter.valid) {
+        document.getElementById('inv-state').textContent = data.inverter.state;
+        document.getElementById('inv-power').textContent = Math.round(data.inverter.bat_power_w) + ' W';
+        document.getElementById('bat-voltage').textContent = data.inverter.bat_voltage_v.toFixed(1) + ' V';
+        document.getElementById('bat-soc').textContent = Math.round(data.inverter.bat_soc_pct) + '%';
+        document.getElementById('soc-fill').style.width = data.inverter.bat_soc_pct + '%';
+        if (data.inverter.ac_in_voltage_v > 0) {
+            document.getElementById('inv-ac-in-v').textContent = data.inverter.ac_in_voltage_v.toFixed(1) + ' V';
+            document.getElementById('inv-ac-in-a').textContent = data.inverter.ac_in_current_a.toFixed(1) + ' A';
+        }
+        if (data.inverter.ac_out_voltage_v > 0) {
+            document.getElementById('inv-ac-out-v').textContent = data.inverter.ac_out_voltage_v.toFixed(1) + ' V';
+            document.getElementById('inv-ac-out-a').textContent = data.inverter.ac_out_current_a.toFixed(1) + ' A';
+        }
+    }
+    if (data.battery && data.battery.valid) {
+        document.querySelector('.battery-card').classList.add('connected');
+        document.getElementById('bmv-product').textContent = data.battery.product_name || '---';
+        document.getElementById('bmv-voltage').textContent = data.battery.voltage_v.toFixed(2) + ' V';
+        document.getElementById('bmv-current').textContent = data.battery.current_a.toFixed(2) + ' A';
+        document.getElementById('bmv-power').textContent = Math.round(data.battery.power_w) + ' W';
+        document.getElementById('bmv-soc').textContent = data.battery.soc_percent.toFixed(1) + '%';
+        var ttg = data.battery.time_to_go_min;
+        if (ttg > 0) {
+            var h = Math.floor(ttg / 60);
+            var m = ttg % 60;
+            document.getElementById('bmv-ttg').textContent = h + 'h ' + m + 'm';
+        } else if (ttg === -1) {
+            document.getElementById('bmv-ttg').textContent = 'Infinite';
+        } else {
+            document.getElementById('bmv-ttg').textContent = '---';
+        }
+        var alarmEl = document.getElementById('bmv-alarm');
+        if (data.battery.alarm_active && data.battery.alarm_reason) {
+            alarmEl.textContent = 'ALARM: ' + data.battery.alarm_reason;
+        } else {
+            alarmEl.textContent = '';
+        }
+        document.getElementById('bmv-charged').textContent = data.battery.charged_kwh.toFixed(2) + ' kWh';
+        document.getElementById('bmv-discharged').textContent = data.battery.discharged_kwh.toFixed(2) + ' kWh';
+        document.getElementById('bmv-consumed').textContent = data.battery.consumed_ah.toFixed(2) + ' Ah';
+        document.getElementById('bmv-cycles').textContent = data.battery.charge_cycles || '---';
+        document.getElementById('bmv-min-v').textContent = data.battery.min_voltage_v ? data.battery.min_voltage_v.toFixed(2) + ' V' : '---';
+        document.getElementById('bmv-max-v').textContent = data.battery.max_voltage_v ? data.battery.max_voltage_v.toFixed(2) + ' V' : '---';
+        if (data.battery.seconds_since_full_charge > 0) {
+            var sh = Math.floor(data.battery.seconds_since_full_charge / 3600);
+            var sm = Math.floor((data.battery.seconds_since_full_charge % 3600) / 60);
+            document.getElementById('bmv-since-full').textContent = sh + 'h ' + sm + 'm';
+        } else {
+            document.getElementById('bmv-since-full').textContent = '---';
+        }
+        if (data.battery.has_temperature) {
+            document.getElementById('bmv-temp').textContent = data.battery.temperature_c.toFixed(1) + 'C';
+        } else {
+            document.getElementById('bmv-temp').textContent = '---';
+        }
+        document.getElementById('bmv-fw').textContent = data.battery.firmware_version || '---';
+        document.getElementById('bmv-serial').textContent = data.battery.serial_number || '---';
+    } else {
+        document.querySelector('.battery-card').classList.remove('connected');
+    }
+    if (data.pid) {
+        document.getElementById('pid-output').textContent = Math.round(data.pid.output_w) + ' W';
+    }
+    if (data.mode) {
+        document.getElementById('mode-name').textContent = data.mode.current;
+        document.getElementById('mode-desc').textContent = data.mode.description;
+        // Update mode buttons
+        document.querySelectorAll('.mode-selector button').forEach(function(btn) {
+            var modes = ['scheduled', 'pid', 'tou', 'solar', 'battery_save'];
+            modes.forEach(function(m) {
+                if (btn.onclick && btn.onclick.toString().includes("'" + m + "'")) {
+                    btn.className = (data.mode.current === m) ? 'active' : '';
                 }
-                if (data.inverter.ac_out_voltage_v > 0) {
-                    document.getElementById('inv-ac-out-v').textContent = data.inverter.ac_out_voltage_v.toFixed(1) + ' V';
-                    document.getElementById('inv-ac-out-a').textContent = data.inverter.ac_out_current_a.toFixed(1) + ' A';
-                }
+            });
+        });
+        if (data.mode.override !== overrideActive) {
+            overrideActive = data.mode.override;
+            if (!overrideActive) {
+                document.getElementById('override-slider').value = 0;
+                document.getElementById('override-value').textContent = '0 W';
             }
-            if (data.battery && data.battery.valid) {
-                document.querySelector('.battery-card').classList.add('connected');
-                document.getElementById('bmv-product').textContent = data.battery.product_name || '---';
-                document.getElementById('bmv-voltage').textContent = data.battery.voltage_v.toFixed(2) + ' V';
-                document.getElementById('bmv-current').textContent = data.battery.current_a.toFixed(2) + ' A';
-                document.getElementById('bmv-power').textContent = Math.round(data.battery.power_w) + ' W';
-                document.getElementById('bmv-soc').textContent = data.battery.soc_percent.toFixed(1) + '%';
-                const ttg = data.battery.time_to_go_min;
-                if (ttg > 0) {
-                    const h = Math.floor(ttg / 60);
-                    const m = ttg % 60;
-                    document.getElementById('bmv-ttg').textContent = h + 'h ' + m + 'm';
-                } else if (ttg === -1) {
-                    document.getElementById('bmv-ttg').textContent = 'Infinite';
+        }
+        if (overrideActive && data.mode.override_value_w !== undefined) {
+            var serverValue = Math.round(data.mode.override_value_w);
+            var slider = document.getElementById('override-slider');
+            if (parseInt(slider.value) !== serverValue) {
+                slider.value = serverValue;
+                document.getElementById('override-value').textContent = serverValue + ' W';
+            }
+        }
+        if (data.mode.simulated_load !== simLoadActive) {
+            simLoadActive = data.mode.simulated_load;
+            var statusEl = document.getElementById('simload-status');
+            if (simLoadActive) {
+                statusEl.classList.add('active');
+                var val = Math.round(data.mode.simulated_load_w);
+                if (val > 0) {
+                    statusEl.textContent = 'ACTIVE: Discharging ' + val + 'W to simulated load';
+                } else if (val < 0) {
+                    statusEl.textContent = 'ACTIVE: Charging ' + (-val) + 'W from grid';
                 } else {
-                    document.getElementById('bmv-ttg').textContent = '---';
+                    statusEl.textContent = 'ACTIVE: Holding at 0W';
                 }
-                // Alarm
-                var alarmEl = document.getElementById('bmv-alarm');
-                if (data.battery.alarm_active && data.battery.alarm_reason) {
-                    alarmEl.textContent = 'ALARM: ' + data.battery.alarm_reason;
-                } else {
-                    alarmEl.textContent = '';
-                }
-                // Energy totals
-                document.getElementById('bmv-charged').textContent = data.battery.charged_kwh.toFixed(2) + ' kWh';
-                document.getElementById('bmv-discharged').textContent = data.battery.discharged_kwh.toFixed(2) + ' kWh';
-                document.getElementById('bmv-consumed').textContent = data.battery.consumed_ah.toFixed(2) + ' Ah';
-                document.getElementById('bmv-cycles').textContent = data.battery.charge_cycles || '---';
-                // History
-                document.getElementById('bmv-min-v').textContent = data.battery.min_voltage_v ? data.battery.min_voltage_v.toFixed(2) + ' V' : '---';
-                document.getElementById('bmv-max-v').textContent = data.battery.max_voltage_v ? data.battery.max_voltage_v.toFixed(2) + ' V' : '---';
-                if (data.battery.seconds_since_full_charge > 0) {
-                    var sh = Math.floor(data.battery.seconds_since_full_charge / 3600);
-                    var sm = Math.floor((data.battery.seconds_since_full_charge % 3600) / 60);
-                    document.getElementById('bmv-since-full').textContent = sh + 'h ' + sm + 'm';
-                } else {
-                    document.getElementById('bmv-since-full').textContent = '---';
-                }
-                if (data.battery.has_temperature) {
-                    document.getElementById('bmv-temp').textContent = data.battery.temperature_c.toFixed(1) + 'C';
-                } else {
-                    document.getElementById('bmv-temp').textContent = '---';
-                }
-                // Device info
-                document.getElementById('bmv-fw').textContent = data.battery.firmware_version || '---';
-                document.getElementById('bmv-serial').textContent = data.battery.serial_number || '---';
             } else {
-                document.querySelector('.battery-card').classList.remove('connected');
+                statusEl.classList.remove('active');
+                statusEl.textContent = '';
+                document.getElementById('simload-slider').value = 0;
+                document.getElementById('simload-value').textContent = '0 W';
             }
-            if (data.pid) {
-                document.getElementById('pid-output').textContent = Math.round(data.pid.output_w) + ' W';
+        }
+        if (simLoadActive && data.mode.simulated_load_w !== undefined) {
+            var simVal = Math.round(data.mode.simulated_load_w);
+            var simSlider = document.getElementById('simload-slider');
+            if (parseInt(simSlider.value) !== simVal) {
+                simSlider.value = simVal;
+                document.getElementById('simload-value').textContent = simVal + ' W';
             }
-            if (data.mode) {
-                document.getElementById('mode-name').textContent = data.mode.current;
-                document.getElementById('mode-desc').textContent = data.mode.description;
-                // Sync override state from server (but don't change slider if user is dragging)
-                if (data.mode.override !== overrideActive) {
-                    overrideActive = data.mode.override;
-                    if (!overrideActive) {
-                        // Override was cleared, reset slider to 0
-                        document.getElementById('override-slider').value = 0;
-                        document.getElementById('override-value').textContent = '0 W';
-                    }
-                }
-                // If override is active, sync the value from server
-                if (overrideActive && data.mode.override_value_w !== undefined) {
-                    var serverValue = Math.round(data.mode.override_value_w);
-                    var slider = document.getElementById('override-slider');
-                    // Only update if different (to avoid interrupting user interaction)
-                    if (parseInt(slider.value) !== serverValue) {
-                        slider.value = serverValue;
-                        document.getElementById('override-value').textContent = serverValue + ' W';
-                    }
-                }
-                // Sync simulated load state
-                if (data.mode.simulated_load !== simLoadActive) {
-                    simLoadActive = data.mode.simulated_load;
-                    var statusEl = document.getElementById('simload-status');
-                    if (simLoadActive) {
-                        statusEl.classList.add('active');
-                        var val = Math.round(data.mode.simulated_load_w);
-                        if (val > 0) {
-                            statusEl.textContent = 'ACTIVE: Discharging ' + val + 'W to simulated load';
-                        } else if (val < 0) {
-                            statusEl.textContent = 'ACTIVE: Charging ' + (-val) + 'W from grid';
-                        } else {
-                            statusEl.textContent = 'ACTIVE: Holding at 0W';
-                        }
-                    } else {
-                        statusEl.classList.remove('active');
-                        statusEl.textContent = '';
-                        document.getElementById('simload-slider').value = 0;
-                        document.getElementById('simload-value').textContent = '0 W';
-                    }
-                }
-                // If simulated load is active, sync the value from server
-                if (simLoadActive && data.mode.simulated_load_w !== undefined) {
-                    var simVal = Math.round(data.mode.simulated_load_w);
-                    var simSlider = document.getElementById('simload-slider');
-                    if (parseInt(simSlider.value) !== simVal) {
-                        simSlider.value = simVal;
-                        document.getElementById('simload-value').textContent = simVal + ' W';
-                    }
-                }
+        }
+    }
+    // Update timestamp
+    if (data.timestamp) {
+        document.querySelector('.timestamp').textContent = 'Updated: ' + new Date(data.timestamp).toLocaleString() + ' (WebSocket)';
+    }
+}
+
+function connectWebSocket() {
+    if (ws && ws.readyState === WebSocket.OPEN) return;
+
+    var protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var wsUrl = protocol + '//' + window.location.host + '/ws';
+
+    try {
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = function() {
+            console.log('WebSocket connected');
+            wsConnected = true;
+            document.querySelector('.timestamp').textContent = 'Connected (WebSocket)';
+        };
+
+        ws.onmessage = function(event) {
+            try {
+                var data = JSON.parse(event.data);
+                updateDashboard(data);
+            } catch (e) {
+                console.error('Failed to parse WebSocket message:', e);
             }
-        })
-        .catch(() => {});
-}, 2000);
+        };
+
+        ws.onclose = function() {
+            console.log('WebSocket disconnected, reconnecting...');
+            wsConnected = false;
+            document.querySelector('.timestamp').textContent = 'Disconnected, reconnecting...';
+            ws = null;
+            // Reconnect after 2 seconds
+            if (wsReconnectTimeout) clearTimeout(wsReconnectTimeout);
+            wsReconnectTimeout = setTimeout(connectWebSocket, 2000);
+        };
+
+        ws.onerror = function(err) {
+            console.error('WebSocket error:', err);
+            ws.close();
+        };
+    } catch (e) {
+        console.error('WebSocket connection failed:', e);
+        // Fallback to polling
+        if (wsReconnectTimeout) clearTimeout(wsReconnectTimeout);
+        wsReconnectTimeout = setTimeout(connectWebSocket, 5000);
+    }
+}
+
+// Start WebSocket connection
+connectWebSocket();
+
+// Fallback polling if WebSocket fails for more than 10 seconds
+var pollFallbackInterval = null;
+setTimeout(function() {
+    if (!wsConnected) {
+        console.log('WebSocket not connected, starting fallback polling');
+        pollFallbackInterval = setInterval(function() {
+            if (wsConnected) {
+                clearInterval(pollFallbackInterval);
+                return;
+            }
+            fetch('/api/status')
+                .then(function(r) { return r.json(); })
+                .then(updateDashboard)
+                .catch(function() {});
+        }, 2000);
+    }
+}, 10000);
 `, overrideActiveJS, simLoadActiveJS)
 }
 

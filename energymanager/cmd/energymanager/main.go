@@ -23,6 +23,7 @@ import (
 	"github.com/diebietse/invertergui/energymanager/usbdetect"
 	"github.com/diebietse/invertergui/energymanager/vebus"
 	"github.com/diebietse/invertergui/energymanager/vedirect"
+	"github.com/diebietse/invertergui/energymanager/vrm"
 	"github.com/diebietse/invertergui/energymanager/webui"
 )
 
@@ -54,9 +55,9 @@ var (
 
 	// PID Controller
 	pidEnabled  = flag.Bool("pid.enabled", true, "Enable PID controller")
-	pidKp       = flag.Float64("pid.kp", 0.8, "PID proportional gain")
-	pidKi       = flag.Float64("pid.ki", 0.05, "PID integral gain")
-	pidKd       = flag.Float64("pid.kd", 0.1, "PID derivative gain")
+	pidKp       = flag.Float64("pid.kp", 1.1, "PID proportional gain (1.1 = 110% for losses)")
+	pidKi       = flag.Float64("pid.ki", 0.15, "PID integral gain")
+	pidKd       = flag.Float64("pid.kd", 0.05, "PID derivative gain")
 	pidSetpoint = flag.Float64("pid.setpoint", 0, "PID setpoint (target grid power)")
 
 	// Operating mode
@@ -83,6 +84,12 @@ var (
 	// Auth (for web UI config/control pages)
 	authUsername = flag.String("auth.username", "", "Admin username (default: admin)")
 	authPassword = flag.String("auth.password", "", "Admin password (default: energy)")
+
+	// VRM (Victron Remote Monitoring)
+	vrmEnabled     = flag.Bool("vrm.enabled", false, "Enable VRM MQTT publishing")
+	vrmPortalID    = flag.String("vrm.portalid", "", "VRM Portal ID (e.g., b827eb7388f1)")
+	vrmAccessToken = flag.String("vrm.token", "", "VRM access token")
+	vrmEmail       = flag.String("vrm.email", "", "VRM account email (optional)")
 )
 
 func main() {
@@ -455,6 +462,17 @@ func main() {
 		}
 	}
 
+	// Start VRM publisher if enabled
+	if *vrmEnabled && *vrmPortalID != "" && *vrmAccessToken != "" {
+		webHandler.SetInitStatus("vrm", "Connecting to VRM...", false, "")
+		if err := svcMgr.startVRM(*vrmPortalID, *vrmAccessToken, *vrmEmail); err != nil {
+			log.Printf("Warning: Failed to start VRM publisher: %v", err)
+			webHandler.SetInitStatus("vrm", "VRM connection failed: "+err.Error(), false, err.Error())
+		} else {
+			webHandler.SetInitStatus("vrm", "Connected to VRM", true, "")
+		}
+	}
+
 	// Set up runtime reconfiguration callbacks
 	webHandler.SetCallbacks(&webui.ServiceCallbacks{
 		ReconfigureMQTT: func(enabled bool, broker, topic, clientID, username, password string) error {
@@ -503,6 +521,7 @@ type serviceManager struct {
 	hub          *core.Hub
 	mqttPub      *mqtt.Publisher
 	influxWriter *influxdb.Writer
+	vrmPub       *vrm.Publisher
 	mu           sync.Mutex
 }
 
@@ -590,9 +609,45 @@ func (sm *serviceManager) stopInfluxDB() {
 	}
 }
 
+func (sm *serviceManager) startVRM(portalID, accessToken, email string) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if sm.vrmPub != nil {
+		sm.vrmPub.Stop()
+	}
+
+	sm.vrmPub = vrm.New(sm.hub, vrm.Config{
+		PortalID:    portalID,
+		AccessToken: accessToken,
+		Email:       email,
+		Enabled:     true,
+	})
+
+	if err := sm.vrmPub.Start(); err != nil {
+		sm.vrmPub = nil
+		return err
+	}
+
+	log.Printf("VRM publishing to portal %s", portalID)
+	return nil
+}
+
+func (sm *serviceManager) stopVRM() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if sm.vrmPub != nil {
+		sm.vrmPub.Stop()
+		sm.vrmPub = nil
+		log.Println("VRM publisher stopped")
+	}
+}
+
 func (sm *serviceManager) stopAll() {
 	sm.stopMQTT()
 	sm.stopInfluxDB()
+	sm.stopVRM()
 }
 
 func discoverShelly() string {

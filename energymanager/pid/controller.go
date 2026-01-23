@@ -61,15 +61,15 @@ type Config struct {
 // DefaultConfig returns sensible defaults for energy management
 func DefaultConfig() Config {
 	return Config{
-		Kp:              0.8,   // Respond to 80% of error immediately
-		Ki:              0.05,  // Slow integral to avoid oscillation
-		Kd:              0.1,   // Small derivative for smoothing
+		Kp:              1.1,   // Slightly over 1:1 to compensate for losses
+		Ki:              0.15,  // Integral to eliminate steady-state error
+		Kd:              0.05,  // Small derivative for smoothing
 		Setpoint:        0,     // Target 0W grid power
 		MinOutput:       -5000, // Max 5000W feed to grid
 		MaxOutput:       5000,  // Max 5000W charge from grid
-		MaxIntegral:     2000,  // Limit integral windup
-		Deadband:        20,    // Ignore errors < 20W
-		MaxRateOfChange: 500,   // Max 500W/s change
+		MaxIntegral:     5000,  // Allow full integral range
+		Deadband:        10,    // Ignore errors < 10W
+		MaxRateOfChange: 2000,  // Allow 2000W/s change for faster response
 	}
 }
 
