@@ -133,6 +133,33 @@ func (c *Controller) Update(gridPower float64) float64 {
 	// Calculate raw output
 	output := pTerm + iTerm + dTerm
 
+	// Asymmetric control: be more conservative when approaching export
+	// If grid is already low (near zero or negative), reduce output aggressiveness
+	// to avoid overshooting into export territory
+	if gridPower < 100 && output < -100 {
+		// Near zero grid - scale down output to prevent export overshoot
+		// The closer to zero (or negative), the more we scale down
+		scaleFactor := 0.5 + (gridPower / 200.0) // 0.5 at grid=0, 1.0 at grid=100
+		if scaleFactor < 0.3 {
+			scaleFactor = 0.3 // Don't go below 30%
+		}
+		if scaleFactor > 1.0 {
+			scaleFactor = 1.0
+		}
+		output = output * scaleFactor
+	}
+
+	// If we're already exporting (grid < 0), drastically reduce output to stop export
+	if gridPower < 0 {
+		// Exporting - reduce inverter output to stop export
+		// Use positive output (charge) to absorb the export
+		output = output * 0.3 // Only 30% response when exporting
+		// Also reset integral to prevent windup during export
+		if c.integral < 0 {
+			c.integral = c.integral * 0.9 // Decay integral when exporting
+		}
+	}
+
 	// Rate limiting
 	if c.MaxRateOfChange > 0 {
 		maxChange := c.MaxRateOfChange * dt

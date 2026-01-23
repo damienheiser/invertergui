@@ -55,10 +55,10 @@ var (
 
 	// PID Controller
 	pidEnabled  = flag.Bool("pid.enabled", true, "Enable PID controller")
-	pidKp       = flag.Float64("pid.kp", 1.1, "PID proportional gain (1.1 = 110% for losses)")
-	pidKi       = flag.Float64("pid.ki", 0.15, "PID integral gain")
-	pidKd       = flag.Float64("pid.kd", 0.05, "PID derivative gain")
-	pidSetpoint = flag.Float64("pid.setpoint", 0, "PID setpoint (target grid power)")
+	pidKp       = flag.Float64("pid.kp", 0.95, "PID proportional gain (0.95 = slight under-correction to avoid export)")
+	pidKi       = flag.Float64("pid.ki", 0.08, "PID integral gain (lower to prevent overshoot)")
+	pidKd       = flag.Float64("pid.kd", 0.03, "PID derivative gain")
+	pidSetpoint = flag.Float64("pid.setpoint", 30, "PID setpoint (target grid power, 30W import buffer to avoid export)")
 
 	// Operating mode
 	defaultMode = flag.String("mode", "pid", "Default operating mode (manual, pid, tou, solar, battery_save)")
