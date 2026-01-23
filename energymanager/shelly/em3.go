@@ -9,65 +9,80 @@ import (
 )
 
 // Shelly Pro 3EM Modbus Register Addresses (Input Registers, Function Code 4)
-// Official register map from Shelly documentation
-// All registers are Float32 (2 registers each, Big-Endian)
+// This device uses EM1 components (not EM), each channel has its own component
+// Shelly Gen2 documentation says 32000, but actual Modbus address is 2000
+// All Float32 values are IEEE 754 format (2 registers each), big-endian
+// Each EM1 component block is 20 registers
+// Within block: timestamp(2), error(2), voltage(2), current(2), power(2), apparent(2), pf(2), errors(3), freq(2), reserved(1)
 const (
-	// Phase A (L1) - starting at register 0
-	RegPhaseAPower       = 0  // Active Power (W)
-	RegPhaseAApparent    = 2  // Apparent Power (VA)
-	RegPhaseACurrent     = 4  // Current (A)
-	RegPhaseAVoltage     = 6  // Voltage (V)
-	RegPhaseAPowerFactor = 8  // Power Factor
+	// EM1:0 (Phase A) registers - block starts at 2000
+	em1_0_Base = 2000
+	// EM1:1 (Phase B) registers - block starts at 2020
+	em1_1_Base = 2020
+	// EM1:2 (Phase C) registers - block starts at 2040
+	em1_2_Base = 2040
+)
 
-	// Phase B (L2) - starting at register 10
-	RegPhaseBPower       = 10 // Active Power (W)
-	RegPhaseBApparent    = 12 // Apparent Power (VA)
-	RegPhaseBCurrent     = 14 // Current (A)
-	RegPhaseBVoltage     = 16 // Voltage (V)
-	RegPhaseBPowerFactor = 18 // Power Factor
+// GridPowerSource defines which value to use as the grid power reading
+type GridPowerSource string
 
-	// Phase C (L3) - starting at register 20
-	RegPhaseCPower       = 20 // Active Power (W)
-	RegPhaseCApparent    = 22 // Apparent Power (VA)
-	RegPhaseCCurrent     = 24 // Current (A)
-	RegPhaseCVoltage     = 26 // Voltage (V)
-	RegPhaseCPowerFactor = 28 // Power Factor
-
-	// Total values - starting at register 30
-	RegTotalPower    = 30 // Total Active Power (W)
-	RegTotalApparent = 32 // Total Apparent Power (VA)
-	RegTotalCurrent  = 34 // Total Current (A)
+const (
+	GridPowerTotal   GridPowerSource = "total"    // Sum of all phases (default)
+	GridPowerPhaseA  GridPowerSource = "phase_a"  // Use Phase A only
+	GridPowerPhaseB  GridPowerSource = "phase_b"  // Use Phase B only
+	GridPowerPhaseC  GridPowerSource = "phase_c"  // Use Phase C only (entire power station)
+	GridPowerPhaseAB GridPowerSource = "phase_ab" // Sum of Phase A + Phase B (for PID)
 )
 
 // EM3 represents a Shelly Pro EM3 energy meter
 type EM3 struct {
-	client       *ModbusClient
-	addr         string
-	unitID       byte
-	interval     time.Duration
-	dataCh       chan *core.GridData
-	stopCh       chan struct{}
-	wg           sync.WaitGroup
-	mu           sync.RWMutex
-	connected    bool
-	lastError    string
-	errorCount   int
-	reconnecting bool
+	client          *ModbusClient
+	addr            string
+	unitID          byte
+	interval        time.Duration
+	gridPowerSource GridPowerSource
+	dataCh          chan *core.GridData
+	stopCh          chan struct{}
+	wg              sync.WaitGroup
+	mu              sync.RWMutex
+	connected       bool
+	lastError       string
+	errorCount      int
+	reconnecting    bool
 }
 
 // NewEM3 creates a new Shelly Pro EM3 driver
-func NewEM3(addr string, pollInterval time.Duration) *EM3 {
+// gridPowerSource specifies which value to use as the grid power reading
+func NewEM3(addr string, pollInterval time.Duration, gridPowerSource GridPowerSource) *EM3 {
 	if pollInterval == 0 {
 		pollInterval = time.Second
 	}
-	return &EM3{
-		client:   NewModbusClient(addr, 5*time.Second),
-		addr:     addr,
-		unitID:   1, // Shelly default unit ID
-		interval: pollInterval,
-		dataCh:   make(chan *core.GridData, 8),
-		stopCh:   make(chan struct{}),
+	if gridPowerSource == "" {
+		gridPowerSource = GridPowerTotal
 	}
+	return &EM3{
+		client:          NewModbusClient(addr, 5*time.Second),
+		addr:            addr,
+		unitID:          1, // Shelly default unit ID
+		interval:        pollInterval,
+		gridPowerSource: gridPowerSource,
+		dataCh:          make(chan *core.GridData, 8),
+		stopCh:          make(chan struct{}),
+	}
+}
+
+// SetGridPowerSource changes which phase/total to use for grid power
+func (e *EM3) SetGridPowerSource(source GridPowerSource) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.gridPowerSource = source
+}
+
+// GetGridPowerSource returns the current grid power source setting
+func (e *EM3) GetGridPowerSource() GridPowerSource {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.gridPowerSource
 }
 
 // Connected returns true if currently connected to the Shelly
@@ -194,38 +209,73 @@ func (e *EM3) pollLoop() {
 func (e *EM3) readAll() *core.GridData {
 	data := &core.GridData{Valid: true}
 
-	// Read all data in one request (registers 0-35, 36 registers = 18 floats)
-	// This is more efficient than multiple requests
-	allRegs, err := e.client.ReadInputRegisters(e.unitID, 0, 36)
+	// Read EM1:0 (Phase A) - 20 registers for full block
+	phaseARegs, err := e.client.ReadInputRegisters(e.unitID, uint16(em1_0_Base), 20)
 	if err != nil {
-		log.Printf("shelly: read all error: %v", err)
+		log.Printf("shelly: read phase A (EM1:0) error: %v", err)
 		return &core.GridData{Valid: false, Error: err.Error()}
 	}
 
-	// Parse Phase A (registers 0-9)
-	data.Phases[0] = parsePhaseData(allRegs, 0)
+	// Read EM1:1 (Phase B) - 20 registers for full block
+	phaseBRegs, err := e.client.ReadInputRegisters(e.unitID, uint16(em1_1_Base), 20)
+	if err != nil {
+		log.Printf("shelly: read phase B (EM1:1) error: %v", err)
+		return &core.GridData{Valid: false, Error: err.Error()}
+	}
 
-	// Parse Phase B (registers 10-19)
-	data.Phases[1] = parsePhaseData(allRegs, 10)
+	// Read EM1:2 (Phase C) - 20 registers for full block
+	phaseCRegs, err := e.client.ReadInputRegisters(e.unitID, uint16(em1_2_Base), 20)
+	if err != nil {
+		log.Printf("shelly: read phase C (EM1:2) error: %v", err)
+		return &core.GridData{Valid: false, Error: err.Error()}
+	}
 
-	// Parse Phase C (registers 20-29)
-	data.Phases[2] = parsePhaseData(allRegs, 20)
+	// Parse phases - offset 3 is voltage (after timestamp(2)+error(1))
+	data.Phases[0] = parsePhaseData(phaseARegs)
+	data.Phases[1] = parsePhaseData(phaseBRegs)
+	data.Phases[2] = parsePhaseData(phaseCRegs)
 
-	// Parse totals (registers 30-35)
-	data.TotalPower = RegistersToFloat32(allRegs, 30)    // Total Active Power
-	data.TotalApparent = RegistersToFloat32(allRegs, 32) // Total Apparent Power
-	data.TotalCurrent = RegistersToFloat32(allRegs, 34)  // Total Current
+	// Select which value to use as the "total" grid power based on configuration
+	e.mu.RLock()
+	source := e.gridPowerSource
+	e.mu.RUnlock()
+
+	switch source {
+	case GridPowerPhaseA:
+		data.TotalPower = data.Phases[0].ActivePower
+		data.TotalCurrent = data.Phases[0].Current
+		data.TotalApparent = data.Phases[0].ApparentPower
+	case GridPowerPhaseB:
+		data.TotalPower = data.Phases[1].ActivePower
+		data.TotalCurrent = data.Phases[1].Current
+		data.TotalApparent = data.Phases[1].ApparentPower
+	case GridPowerPhaseC:
+		data.TotalPower = data.Phases[2].ActivePower
+		data.TotalCurrent = data.Phases[2].Current
+		data.TotalApparent = data.Phases[2].ApparentPower
+	case GridPowerPhaseAB:
+		// Phase A + Phase B = Site Total Wattage (for PID control)
+		data.TotalPower = data.Phases[0].ActivePower + data.Phases[1].ActivePower
+		data.TotalCurrent = data.Phases[0].Current + data.Phases[1].Current
+		data.TotalApparent = data.Phases[0].ApparentPower + data.Phases[1].ApparentPower
+	default: // GridPowerTotal - sum all three phases
+		data.TotalPower = data.Phases[0].ActivePower + data.Phases[1].ActivePower + data.Phases[2].ActivePower
+		data.TotalCurrent = data.Phases[0].Current + data.Phases[1].Current + data.Phases[2].Current
+		data.TotalApparent = data.Phases[0].ApparentPower + data.Phases[1].ApparentPower + data.Phases[2].ApparentPower
+	}
 
 	return data
 }
 
-func parsePhaseData(regs []uint16, offset int) core.PhaseData {
+// parsePhaseData extracts phase data from a 20-register EM1 block
+// Block layout verified empirically: timestamp(2), error(2), voltage(2), current(2), power(2), apparent(2), pf(2), errors(3), freq(2)
+func parsePhaseData(regs []uint16) core.PhaseData {
 	return core.PhaseData{
-		ActivePower:   RegistersToFloat32(regs, offset+0), // Power (W)
-		ApparentPower: RegistersToFloat32(regs, offset+2), // Apparent (VA)
-		Current:       RegistersToFloat32(regs, offset+4), // Current (A)
-		Voltage:       RegistersToFloat32(regs, offset+6), // Voltage (V)
-		PowerFactor:   RegistersToFloat32(regs, offset+8), // Power Factor
-		Frequency:     50.0,                               // Not provided, assume 50Hz
+		Voltage:       RegistersToFloat32(regs, 4),  // Voltage (V) - offset 4
+		Current:       RegistersToFloat32(regs, 6),  // Current (A) - offset 6
+		ActivePower:   RegistersToFloat32(regs, 8),  // Power (W) - offset 8
+		ApparentPower: RegistersToFloat32(regs, 10), // Apparent (VA) - offset 10
+		PowerFactor:   RegistersToFloat32(regs, 12), // Power Factor - offset 12
+		Frequency:     60.0,                         // Frequency not reliably at fixed offset, use default
 	}
 }

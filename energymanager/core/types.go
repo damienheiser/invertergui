@@ -138,6 +138,10 @@ type ModeData struct {
 	Override     bool          `json:"override"`         // Manual override active
 	OverrideVal  float64       `json:"override_value_w"` // Manual override value
 
+	// Simulated load - pretends there's grid consumption to force inverter out of bypass
+	SimulatedLoad   bool    `json:"simulated_load"`            // Simulated load active
+	SimulatedLoadW  float64 `json:"simulated_load_w"`          // Simulated load value in watts
+
 	// Schedule specific
 	ScheduleEnabled bool   `json:"schedule_enabled,omitempty"`
 	SchedulePeriod  string `json:"schedule_period,omitempty"` // Current schedule period name

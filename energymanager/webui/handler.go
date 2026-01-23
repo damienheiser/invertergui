@@ -177,6 +177,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/config", h.handleConfig)
 	mux.HandleFunc("/api/mode", h.handleMode)
 	mux.HandleFunc("/api/override", h.handleOverride)
+	mux.HandleFunc("/api/simulated-load", h.handleSimulatedLoad)
 	mux.HandleFunc("/api/discover", h.handleDiscover)
 	mux.HandleFunc("/api/tou", h.handleTOU)
 	mux.HandleFunc("/api/schedule", h.handleSchedule)
@@ -449,6 +450,35 @@ func (h *Handler) handleOverride(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 }
 
+func (h *Handler) handleSimulatedLoad(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method == "GET" {
+		enabled, value := h.modeCtrl.GetSimulatedLoad()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"enabled": enabled,
+			"value":   value,
+		})
+		return
+	}
+
+	if r.Method == "POST" {
+		var req struct {
+			Enabled bool    `json:"enabled"`
+			Value   float64 `json:"value"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		h.modeCtrl.SetSimulatedLoad(req.Enabled, req.Value)
+		w.Write([]byte(`{"status":"ok"}`))
+		return
+	}
+
+	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+}
+
 func (h *Handler) handleDiscover(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -618,6 +648,8 @@ func (h *Handler) dashboardHTML(info *core.EnergyInfo) string {
 	pidOutput := "---"
 	overrideValue := 0
 	overrideActive := false
+	simLoadValue := 0
+	simLoadActive := false
 	timestamp := "---"
 
 	if info != nil {
@@ -704,6 +736,8 @@ func (h *Handler) dashboardHTML(info *core.EnergyInfo) string {
 		pidOutput = fmt.Sprintf("%.0f W", info.PID.Output)
 		overrideValue = int(info.Mode.OverrideVal)
 		overrideActive = info.Mode.Override
+		simLoadValue = int(info.Mode.SimulatedLoadW)
+		simLoadActive = info.Mode.SimulatedLoad
 	}
 
 	bmvClass := ""
@@ -816,6 +850,19 @@ func (h *Handler) dashboardHTML(info *core.EnergyInfo) string {
                 <button onclick="setOverride(true)">Apply</button>
                 <button onclick="setOverride(false)">Clear</button>
             </div>
+
+            <h3>Simulated Load</h3>
+            <p style="color: #64748b; font-size: 0.75rem; margin-bottom: 0.5rem;">
+                Force inverter out of bypass when Shelly is disconnected.
+                Positive = discharge battery, Negative = charge from grid.
+            </p>
+            <div class="override-control">
+                <input type="range" id="simload-slider" min="-5000" max="5000" value="%d" oninput="updateSimLoadDisplay()">
+                <span id="simload-value">%d W</span>
+                <button onclick="setSimulatedLoad(true)">Apply</button>
+                <button onclick="setSimulatedLoad(false)">Clear</button>
+            </div>
+            <div id="simload-status" class="simload-status %s">%s</div>
         </div>
 
         <div class="card links-card">
@@ -850,14 +897,35 @@ func (h *Handler) dashboardHTML(info *core.EnergyInfo) string {
 		modeButtonClass("battery_save", modeStr),
 		modeStr, modeDesc, pidOutput,
 		overrideValue, overrideValue,
+		simLoadValue, simLoadValue,
+		simLoadStatusClass(simLoadActive), simLoadStatusText(simLoadActive, simLoadValue),
 		timestamp,
-		dashboardJS(overrideActive),
+		dashboardJS(overrideActive, simLoadActive),
 	)
 }
 
 func modeButtonClass(mode, current string) string {
 	if mode == current {
 		return "active"
+	}
+	return ""
+}
+
+func simLoadStatusClass(active bool) string {
+	if active {
+		return "active"
+	}
+	return ""
+}
+
+func simLoadStatusText(active bool, value int) string {
+	if active {
+		if value > 0 {
+			return fmt.Sprintf("ACTIVE: Discharging %dW to simulated load", value)
+		} else if value < 0 {
+			return fmt.Sprintf("ACTIVE: Charging %dW from grid", -value)
+		}
+		return "ACTIVE: Holding at 0W"
 	}
 	return ""
 }
@@ -914,6 +982,8 @@ h3 { font-size: 0.875rem; color: #64748b; margin: 1rem 0 0.5rem; }
 .override-control button { padding: 0.5rem 1rem; border: none; border-radius: 0.375rem; cursor: pointer; font-size: 0.875rem; }
 .override-control button:first-of-type { background: #38bdf8; color: #0f172a; }
 .override-control button:last-of-type { background: #475569; color: #f8fafc; }
+.simload-status { font-size: 0.875rem; padding: 0.5rem; border-radius: 0.25rem; margin-top: 0.5rem; display: none; }
+.simload-status.active { display: block; background: #065f46; color: #6ee7b7; }
 .link-button { display: block; padding: 0.75rem 1rem; background: #334155; color: #f8fafc; text-decoration: none; border-radius: 0.375rem; margin-bottom: 0.5rem; text-align: center; transition: background 0.2s; }
 .link-button:hover { background: #475569; }
 .timestamp { text-align: center; color: #64748b; font-size: 0.75rem; margin-top: 2rem; }
@@ -931,14 +1001,19 @@ h3 { font-size: 0.875rem; color: #64748b; margin: 1rem 0 0.5rem; }
 `
 }
 
-func dashboardJS(overrideActive bool) string {
+func dashboardJS(overrideActive, simLoadActive bool) string {
 	overrideActiveJS := "false"
 	if overrideActive {
 		overrideActiveJS = "true"
 	}
+	simLoadActiveJS := "false"
+	if simLoadActive {
+		simLoadActiveJS = "true"
+	}
 	return fmt.Sprintf(`
-// Override state tracking
+// Override and simulated load state tracking
 var overrideActive = %s;
+var simLoadActive = %s;
 
 // Fix navigation links to use port 80 (nginx) instead of current port
 // LuCI runs on nginx (port 80), not on energymanager (port 8081)
@@ -992,6 +1067,21 @@ function updateOverrideDisplay() {
 function setOverride(enabled) {
     const value = enabled ? parseInt(document.getElementById('override-slider').value) : 0;
     fetch('/api/override', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({enabled: enabled, value: value})
+    }).then(() => location.reload());
+}
+
+function updateSimLoadDisplay() {
+    const slider = document.getElementById('simload-slider');
+    const display = document.getElementById('simload-value');
+    display.textContent = slider.value + ' W';
+}
+
+function setSimulatedLoad(enabled) {
+    const value = enabled ? parseInt(document.getElementById('simload-slider').value) : 0;
+    fetch('/api/simulated-load', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({enabled: enabled, value: value})
@@ -1108,11 +1198,41 @@ setInterval(() => {
                         document.getElementById('override-value').textContent = serverValue + ' W';
                     }
                 }
+                // Sync simulated load state
+                if (data.mode.simulated_load !== simLoadActive) {
+                    simLoadActive = data.mode.simulated_load;
+                    var statusEl = document.getElementById('simload-status');
+                    if (simLoadActive) {
+                        statusEl.classList.add('active');
+                        var val = Math.round(data.mode.simulated_load_w);
+                        if (val > 0) {
+                            statusEl.textContent = 'ACTIVE: Discharging ' + val + 'W to simulated load';
+                        } else if (val < 0) {
+                            statusEl.textContent = 'ACTIVE: Charging ' + (-val) + 'W from grid';
+                        } else {
+                            statusEl.textContent = 'ACTIVE: Holding at 0W';
+                        }
+                    } else {
+                        statusEl.classList.remove('active');
+                        statusEl.textContent = '';
+                        document.getElementById('simload-slider').value = 0;
+                        document.getElementById('simload-value').textContent = '0 W';
+                    }
+                }
+                // If simulated load is active, sync the value from server
+                if (simLoadActive && data.mode.simulated_load_w !== undefined) {
+                    var simVal = Math.round(data.mode.simulated_load_w);
+                    var simSlider = document.getElementById('simload-slider');
+                    if (parseInt(simSlider.value) !== simVal) {
+                        simSlider.value = simVal;
+                        document.getElementById('simload-value').textContent = simVal + ' W';
+                    }
+                }
             }
         })
         .catch(() => {});
 }, 2000);
-`, overrideActiveJS)
+`, overrideActiveJS, simLoadActiveJS)
 }
 
 func (h *Handler) configHTML() string {

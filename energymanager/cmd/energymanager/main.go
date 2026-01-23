@@ -31,9 +31,10 @@ var (
 	listenAddr = flag.String("listen", ":8081", "HTTP listen address")
 
 	// Shelly Pro EM3
-	shellyAddr       = flag.String("shelly.addr", "", "Shelly Pro EM3 address (host:port), auto-discover if empty")
-	shellyInterval   = flag.Duration("shelly.interval", time.Second, "Shelly poll interval")
-	shellyAutoConfig = flag.Bool("shelly.autoconfig", true, "Auto-discover and configure Shelly")
+	shellyAddr         = flag.String("shelly.addr", "", "Shelly Pro EM3 address (host:port), auto-discover if empty")
+	shellyInterval     = flag.Duration("shelly.interval", time.Second, "Shelly poll interval")
+	shellyAutoConfig   = flag.Bool("shelly.autoconfig", true, "Auto-discover and configure Shelly")
+	shellyGridSource   = flag.String("shelly.gridsource", "phase_c", "Grid power source: total, phase_a, phase_b, phase_c")
 
 	// Victron MK2/MK3 (VE.Bus inverter control)
 	victronPort     = flag.String("victron.port", "/dev/ttyUSB0", "Victron VE.Bus serial port (MK2/MK3)")
@@ -197,13 +198,14 @@ func main() {
 	var em3 *shelly.EM3
 	if shellyAddress != "" {
 		webHandler.SetInitStatus("shelly", "Connecting to Shelly at "+shellyAddress+"...", false, "")
-		em3 = shelly.NewEM3(shellyAddress, *shellyInterval)
+		gridSource := shelly.GridPowerSource(*shellyGridSource)
+		em3 = shelly.NewEM3(shellyAddress, *shellyInterval, gridSource)
 		if err := em3.Start(); err != nil {
 			log.Printf("Warning: Failed to start Shelly EM3: %v", err)
 			webHandler.SetInitStatus("shelly", "Shelly connection failed: "+err.Error(), false, err.Error())
 			em3 = nil
 		} else {
-			log.Printf("Shelly Pro EM3 polling at %s", shellyAddress)
+			log.Printf("Shelly Pro EM3 polling at %s (grid source=%s)", shellyAddress, *shellyGridSource)
 			webConfig.ShellyAddr = shellyAddress
 		}
 	}
@@ -712,8 +714,18 @@ func controlLoop(hub *core.Hub, em3 *shelly.EM3, vbus *vebus.VEBus, bmv *vedirec
 			}
 		}
 
-		// Calculate setpoint based on current mode (always calculate, even without grid data)
+		// Determine effective grid power (real or simulated)
 		gridPower := info.Grid.TotalPower
+		simulatedLoadActive, simulatedLoadValue := modeCtrl.GetSimulatedLoad()
+		useSimulatedLoad := simulatedLoadActive && !info.Grid.Valid
+
+		if useSimulatedLoad {
+			// Use simulated load as grid power when Shelly is disconnected
+			// Positive simulated load = pretend house is consuming power = inverter will discharge
+			gridPower = simulatedLoadValue
+		}
+
+		// Calculate setpoint based on current mode (always calculate)
 		var setpoint float64
 		setpoint, info.Mode = modeCtrl.Calculate(gridPower)
 
@@ -725,7 +737,7 @@ func controlLoop(hub *core.Hub, em3 *shelly.EM3, vbus *vebus.VEBus, bmv *vedirec
 				pidCtrl.SetSetpoint(setpoint)
 			}
 
-			// Update PID controller - uses 0 grid power if Shelly disconnected
+			// Update PID controller with effective grid power (real or simulated)
 			output = pidCtrl.Update(gridPower)
 			pidSetpoint, lastErr, _, _, _ := pidCtrl.State()
 
@@ -734,27 +746,27 @@ func controlLoop(hub *core.Hub, em3 *shelly.EM3, vbus *vebus.VEBus, bmv *vedirec
 				GridPower: gridPower,
 				Error:     lastErr,
 				Output:    output,
-				Enabled:   info.Grid.Valid, // Only mark as enabled when grid data is valid
+				Enabled:   info.Grid.Valid || useSimulatedLoad, // Enabled when grid valid OR simulated load active
 			}
 		}
 
-		// Send command to inverter (only when grid data valid or override is active)
+		// Send command to inverter
 		if vbus != nil && info.Inverter.Valid {
-			// Use mode output if override, otherwise PID output
 			cmdOutput := output
+
 			if info.Mode.Override {
 				// Override always works, even without grid data
 				cmdOutput = info.Mode.OverrideVal
 				if err := vbus.SetPower(cmdOutput); err != nil {
 					log.Printf("Failed to set inverter power: %v", err)
 				}
-			} else if info.Grid.Valid {
-				// Normal PID control only when grid data is valid
+			} else if info.Grid.Valid || useSimulatedLoad {
+				// Normal PID control when grid data valid OR simulated load active
 				if err := vbus.SetPower(cmdOutput); err != nil {
 					log.Printf("Failed to set inverter power: %v", err)
 				}
 			}
-			// When grid is invalid and no override, don't send commands (hold last state)
+			// When grid is invalid and no override/simulated load, hold last state
 		}
 
 		// Broadcast to subscribers

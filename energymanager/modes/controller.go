@@ -20,6 +20,10 @@ type Controller struct {
 	overrideEnabled bool
 	overrideValue   float64
 
+	// Simulated load - pretends there's grid consumption to force inverter action
+	simulatedLoadEnabled bool
+	simulatedLoadValue   float64
+
 	// Configuration
 	maxPower        float64
 	batteryCapacity float64 // kWh
@@ -105,6 +109,28 @@ func (c *Controller) SetOverride(enabled bool, value float64) {
 	log.Printf("modes: override enabled=%v value=%.0fW", enabled, value)
 }
 
+// SetSimulatedLoad enables simulated grid load to force inverter out of bypass
+// Positive value = pretend house is consuming this many watts (inverter will discharge)
+// This works even when the Shelly grid meter is disconnected
+func (c *Controller) SetSimulatedLoad(enabled bool, value float64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.simulatedLoadEnabled = enabled
+	c.simulatedLoadValue = value
+	if enabled {
+		log.Printf("modes: simulated load enabled=%.0fW (inverter will discharge to 'supply' this load)", value)
+	} else {
+		log.Printf("modes: simulated load disabled")
+	}
+}
+
+// GetSimulatedLoad returns the current simulated load state
+func (c *Controller) GetSimulatedLoad() (enabled bool, value float64) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.simulatedLoadEnabled, c.simulatedLoadValue
+}
+
 // SetTOUSchedule updates TOU schedule
 func (c *Controller) SetTOUSchedule(schedule core.TOUSchedule) {
 	c.mu.Lock()
@@ -157,9 +183,11 @@ func (c *Controller) Calculate(gridPower float64) (float64, core.ModeData) {
 	defer c.mu.RUnlock()
 
 	data := core.ModeData{
-		Current:     c.mode,
-		Override:    c.overrideEnabled,
-		OverrideVal: c.overrideValue,
+		Current:         c.mode,
+		Override:        c.overrideEnabled,
+		OverrideVal:     c.overrideValue,
+		SimulatedLoad:   c.simulatedLoadEnabled,
+		SimulatedLoadW:  c.simulatedLoadValue,
 	}
 
 	// If override is enabled, use that value
